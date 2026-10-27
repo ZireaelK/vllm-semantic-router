@@ -149,6 +149,16 @@ func TestBuiltInCatalogLocalRuntimeReasoningWireContracts(t *testing.T) {
 			wantControls:  map[string]interface{}{"reasoning": map[string]interface{}{"effort": "medium"}},
 		},
 		{
+			name: "Messages Qwen effort without a budget is adaptive", catalog: "qwen/qwen3.8-27b",
+			provider: "anthropic-compatible", providerModelID: "qwen38-27b",
+			apiFormat: config.APIFormatAnthropic, enabled: true, mode: config.ReasoningModeEnabled, effort: "medium",
+			wantTransport: modelcatalog.ReasoningTransportChatTemplate,
+			wantControls: map[string]interface{}{
+				"thinking":      map[string]interface{}{"type": "adaptive"},
+				"output_config": map[string]interface{}{"effort": "medium"},
+			},
+		},
+		{
 			name: "SGLang Qwen top-level effort and template switch", catalog: "qwen/qwen3.8-27b", provider: "sglang",
 			enabled: true, mode: config.ReasoningModeEnabled, effort: "low",
 			wantTransport: modelcatalog.ReasoningTransportEffortTemplateSwitch,
@@ -265,7 +275,7 @@ func TestSameNamedLoRAUsesTheSelectedBaseProvider(t *testing.T) {
 	useReasoning := false
 	selected := config.ModelRef{Model: "base-b", LoRAName: "shared", ModelReasoningControl: config.ModelReasoningControl{UseReasoning: &useReasoning}}
 	decision := &config.Decision{Name: "shared-adapter", ModelRefs: []config.ModelRef{selected}}
-	request := testNeutralRequest("MoM", "route to the selected adapter")
+	request := testNeutralRequest("vllm-sr/auto", "route to the selected adapter")
 	ctx := routingTestContext(llmprotocol.OpenAIChatV1, request)
 	ctx.VSRSelectedDecision = decision
 	ctx.VSRSelectedCandidate = &selected
@@ -279,7 +289,7 @@ func TestSameNamedLoRAUsesTheSelectedBaseProvider(t *testing.T) {
 	require.Equal(t, llmprotocol.OpenAIResponsesV1, dispatch.targetFormat)
 
 	response, err := router.handleEntrypointModelRouting(
-		request, "MoM", decision.Name, entropy.ReasoningDecision{}, "shared", ctx,
+		request, "vllm-sr/auto", decision.Name, entropy.ReasoningDecision{}, "shared", ctx,
 	)
 	require.NoError(t, err)
 	require.Nil(t, response.GetImmediateResponse())

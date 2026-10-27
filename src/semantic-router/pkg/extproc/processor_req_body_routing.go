@@ -354,6 +354,18 @@ func (r *OpenAIRouter) finalizeProviderDispatchResponse(
 		if err := r.rejectDispatchCapabilityMismatch(ctx.SemanticRequest, dispatch, ctx); err != nil {
 			return nil, err
 		}
+		// Masking is the last provider-bound content mutation, and it runs
+		// before the fallback snapshot so a retry cannot replay unmasked
+		// content. All dispatch paths reach this function (#3566).
+		if err := r.applyMaskingBeforeDispatch(ctx); err != nil {
+			metrics.RecordRequestError(dispatch.logicalModel, "masking_error")
+			logging.ComponentErrorEvent("extproc", "masking_failed", map[string]interface{}{
+				"request_id": ctx.RequestID,
+				"model":      dispatch.logicalModel,
+				"error":      err.Error(),
+			})
+			return nil, err
+		}
 		if r.shouldAttemptFallback(ctx) {
 			snapshot, err := cloneSemanticRequestForReplay(ctx.SemanticRequest)
 			if err != nil {
@@ -501,6 +513,9 @@ func (r *OpenAIRouter) appendProviderCredential(
 ) *ext_proc.ProcessingResponse {
 	provider, providerAuth, err := resolveProviderAuth(state.profile)
 	if err != nil {
+		logging.ComponentErrorEvent("extproc", "provider_auth_resolution_failed", map[string]interface{}{
+			"request_id": ctx.RequestID, "model": model, "backend": backendName, "error": err.Error(),
+		})
 		return r.createErrorResponse(500, "Internal routing error. Contact your administrator.")
 	}
 	if providerAuth.Strategy == "none" {
@@ -585,6 +600,7 @@ func (r *OpenAIRouter) applyDecisionHeaderMutations(state *routeHeaderState, ctx
 	setHeaders, removeHeaders := r.buildHeaderMutations(ctx.VSRSelectedDecision)
 	state.setHeaders = append(state.setHeaders, setHeaders...)
 	state.removeHeaders = append(state.removeHeaders, removeHeaders...)
+	r.runRequestExtensions(state, ctx)
 }
 
 func buildRequestBodyContinueResponse(
