@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	"github.com/stretchr/testify/require"
+
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 )
 
@@ -46,6 +49,19 @@ func TestFusionSynthesisTraceThroughExtProc(t *testing.T) {
 					out, err := router.handleLooperExecution(context.Background(), request, decision, ctx)
 					if err != nil {
 						t.Fatal(err)
+					}
+					if stream {
+						// Under RFC #3474 Looper Native Streaming:
+						// Synthesis is delegated upstream to Envoy via CONTINUE BodyResponse
+						require.Nil(t, out.GetImmediateResponse())
+						require.NotNil(t, out.GetRequestBody())
+						require.Equal(t, ext_proc.CommonResponse_CONTINUE, out.GetRequestBody().GetResponse().GetStatus())
+						require.True(t, ctx.LooperStreamingActive)
+						require.Equal(t, "judge", ctx.VSRSelectedModel)
+						if trace {
+							require.NotNil(t, ctx.LooperTrace)
+						}
+						return
 					}
 					immediate := out.GetImmediateResponse()
 					t.Logf("status=%d body=%s", immediate.GetStatus().GetCode(), immediate.GetBody())

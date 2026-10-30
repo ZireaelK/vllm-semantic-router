@@ -13,6 +13,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/decision"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/fallback"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/looper"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/masking"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/modelruntime/tasks"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/projectiontrace"
@@ -425,10 +426,16 @@ type RequestContext struct {
 	ShadowDispatchPluginConfig *config.ShadowDispatchPluginConfig
 
 	// Looper context
-	LooperRequest   bool                  // True only for a request-graph hop: in process, or token-authenticated
-	Hop             *routing.Hop          // The routing context of a hop served in process
-	LooperIteration int                   // The iteration number if this is a looper request
-	LooperLogprobs  *looperLogprobOptions // Native Chat evidence requested by an authenticated internal hop
+	LooperRequest             bool                        // True only for a request-graph hop: in process, or token-authenticated
+	Hop                       *routing.Hop                // The routing context of a hop served in process
+	LooperIteration           int                         // The iteration number if this is a looper request
+	LooperLogprobs            *looperLogprobOptions       // Native Chat evidence requested by an authenticated internal hop
+	LooperStreamingActive     bool                        // True when a native streaming final stage is dispatched through Envoy
+	LooperIntermediateUsage   looper.TokenUsage           // Token usage accumulated from intermediate panel/analysis stages
+	LooperTrace               *looper.FusionTrace         // Execution trace from intermediate stages
+	LooperModelsUsed          []string                    // All model identifiers used across intermediate panel stages
+	LooperQuorumOutcome       *looper.FusionQuorumOutcome // Bounded quorum outcome evidence (e.g. for fallback)
+	LooperAuditedOutputTokens int                         // Estimated output tokens audited from SSE deltas before disconnect
 
 	// ListenerModels, when set, are the only request models the listener the
 	// client request arrived on accepts.

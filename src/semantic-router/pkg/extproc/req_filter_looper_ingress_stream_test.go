@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/stretchr/testify/require"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
@@ -64,6 +65,16 @@ func TestLooperIngressPreservesClientResponseContract(t *testing.T) {
 					decision.Algorithm.Fusion.IncludeIntermediateResponses = &trace
 					response, err := router.handleLooperExecution(context.Background(), request, decision, ctx)
 					require.NoError(t, err)
+					if format == llmprotocol.OpenAIChatV1 && stream {
+						// Under RFC #3474 Looper Native Streaming:
+						// OpenAIChatV1 streaming final stage delegates to Envoy via Body CONTINUE response
+						require.Nil(t, response.GetImmediateResponse())
+						require.NotNil(t, response.GetRequestBody())
+						require.Equal(t, ext_proc.CommonResponse_CONTINUE, response.GetRequestBody().GetResponse().GetStatus())
+						require.True(t, ctx.LooperStreamingActive)
+						require.Equal(t, "judge", ctx.VSRSelectedModel)
+						return
+					}
 					require.EqualValues(t, 200, response.GetImmediateResponse().GetStatus().GetCode())
 					body := string(response.GetImmediateResponse().GetBody())
 					require.Contains(t, body, "A useful answer")

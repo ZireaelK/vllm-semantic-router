@@ -147,6 +147,16 @@ func (r *OpenAIRouter) handleProcessReceiveError(ctx *RequestContext, err error)
 		// idempotent and empty usage stays non-attributable.
 		recordSessionTurnOutcome(ctx, responseUsageMetrics{})
 		logging.Debugf("Streaming response aborted before completion, will not cache")
+		if ctx.LooperStreamingActive && ctx.RouterReplayID != "" {
+			promptTokens := int(ctx.LooperIntermediateUsage.PromptTokens)
+			completionTokens := int(ctx.LooperIntermediateUsage.CompletionTokens) + ctx.LooperAuditedOutputTokens
+			totalTokens := promptTokens + completionTokens
+			r.updateRouterReplayUsageCost(ctx, routerreplay.UsageCost{
+				PromptTokens:     replayIntPtr(promptTokens),
+				CompletionTokens: replayIntPtr(completionTokens),
+				TotalTokens:      replayIntPtr(totalTokens),
+			})
+		}
 	}
 	if ctx.InflightToken != 0 {
 		releaseInflightAdmission(ctx)

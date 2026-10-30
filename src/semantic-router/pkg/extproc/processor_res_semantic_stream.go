@@ -3,6 +3,7 @@ package extproc
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
@@ -144,6 +145,20 @@ func observeProtocolStream(
 		recordProtocolDiagnostic(ctx, normalizeProtocol(string(ctx.SourceFormat)), normalizeProtocol(string(ctx.TargetFormat)), diagnostic)
 	}
 	ctx.SemanticStreamState.observe(events)
+	if ctx != nil && ctx.LooperStreamingActive {
+		for _, event := range events {
+			switch event.Type {
+			case llmprotocol.EventOutputTextDelta, llmprotocol.EventReasoningDelta:
+				if event.Delta != "" {
+					words := len(strings.Fields(event.Delta))
+					if words == 0 {
+						words = 1
+					}
+					ctx.LooperAuditedOutputTokens += words
+				}
+			}
+		}
+	}
 }
 
 // failureFrame returns the frame the encoder wrote for an upstream failure in
@@ -234,6 +249,9 @@ func (r *OpenAIRouter) ensureSemanticResponseStream(ctx *RequestContext) error {
 		ctx.PublicChatUsageFilter = protocolcodec.NewChatPublicStreamFilter(
 			llmprotocol.DefaultPolicy().Limits.SSEFrameBytes, streamUsageRequestedByClient(ctx),
 		)
+		if ctx.LooperStreamingActive && ctx.RequestModel != "" {
+			ctx.PublicChatUsageFilter.SetPublicModel(ctx.RequestModel)
+		}
 	}
 	ctx.SemanticStreamState = &semanticResponseStreamState{
 		usage: llmprotocol.Usage{State: llmprotocol.UsageUnavailable},
