@@ -432,7 +432,7 @@ type RequestContext struct {
 	LooperLogprobs            *looperLogprobOptions       // Native Chat evidence requested by an authenticated internal hop
 	LooperStreamingActive     bool                        // True when a native streaming final stage is dispatched through Envoy
 	LooperIntermediateUsage   looper.TokenUsage           // Token usage accumulated from intermediate panel/analysis stages
-	LooperTrace               *looper.FusionTrace         // Execution trace from intermediate stages
+	LooperTrace               any                         // Execution trace from intermediate stages (e.g. *looper.FusionTrace, *workflowTrace, []RoundResponse)
 	LooperModelsUsed          []string                    // All model identifiers used across intermediate panel stages
 	LooperQuorumOutcome       *looper.FusionQuorumOutcome // Bounded quorum outcome evidence (e.g. for fallback)
 	LooperAuditedOutputTokens int                         // Estimated output tokens audited from SSE deltas before disconnect

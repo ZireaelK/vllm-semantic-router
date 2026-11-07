@@ -91,7 +91,7 @@ func TestParseStreamingResponse_PopulatesUsage(t *testing.T) {
 }
 
 func TestSetStreamParam_StreamingRequestsIncludeUsage(t *testing.T) {
-	out, err := setStreamParam([]byte(`{"model":"x"}`), true)
+	out, err := SetStreamParam([]byte(`{"model":"x"}`), true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestSetStreamParam_StreamingRequestsIncludeUsage(t *testing.T) {
 }
 
 func TestSetStreamParam_NonStreamingDropsStreamOptions(t *testing.T) {
-	out, err := setStreamParam([]byte(`{"model":"x","stream_options":{"include_usage":true}}`), false)
+	out, err := SetStreamParam([]byte(`{"model":"x","stream_options":{"include_usage":true}}`), false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

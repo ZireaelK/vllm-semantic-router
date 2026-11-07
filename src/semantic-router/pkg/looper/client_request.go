@@ -38,7 +38,7 @@ func prepareModelCallBody(req *openai.ChatCompletionNewParams, target ModelTarge
 
 	// Add stream parameter via JSON manipulation (SDK doesn't expose Stream field)
 	streaming := options.Mode == ResponseSSE
-	body, err = setStreamParam(body, streaming)
+	body, err = SetStreamParam(body, streaming)
 	if err != nil {
 		return nil, fmt.Errorf("failed to set stream param: %w", err)
 	}

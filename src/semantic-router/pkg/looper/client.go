@@ -686,13 +686,8 @@ func classifyToolCallChars(text string) []bool {
 	return nil
 }
 
-// SetStreamParam adds or updates the stream parameter in a JSON request body.
+// SetStreamParam adds or updates the stream parameter in a JSON request body
 func SetStreamParam(body []byte, streaming bool) ([]byte, error) {
-	return setStreamParam(body, streaming)
-}
-
-// setStreamParam adds or updates the stream parameter in a JSON request body
-func setStreamParam(body []byte, streaming bool) ([]byte, error) {
 	var reqMap map[string]interface{}
 	if err := json.Unmarshal(body, &reqMap); err != nil {
 		return nil, err

@@ -140,8 +140,10 @@ func TestPrepareStreamingSynthesis_SeparateAnalysisMode(t *testing.T) {
 
 	// Verify trace contains structured analysis
 	require.NotNil(t, plan.Trace)
-	require.NotNil(t, plan.Trace.Analysis)
-	assert.Equal(t, []string{"common fact"}, plan.Trace.Analysis.Consensus)
+	fusionTrace, ok := plan.Trace.(*FusionTrace)
+	require.True(t, ok, "trace should be *FusionTrace")
+	require.NotNil(t, fusionTrace.Analysis)
+	assert.Equal(t, []string{"common fact"}, fusionTrace.Analysis.Consensus)
 
 	// Verify synthesis params
 	assert.Equal(t, "judge", plan.TargetModel)

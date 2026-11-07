@@ -1,3 +1,5 @@
+//go:build envoy_integration
+
 package extproc
 
 import (

@@ -28,7 +28,7 @@ type StreamingSynthesisPlan struct {
 	SynthesisParams   *openai.ChatCompletionNewParams
 	TargetModel       string               // Upstream model target for dispatch
 	IntermediateUsage TokenUsage           // Aggregated usage from intermediate stages (panel + analysis)
-	Trace             *FusionTrace         // Intermediate execution evidence for replay
+	Trace             any                  // Intermediate execution evidence for replay (e.g., *FusionTrace, *workflowTrace, []RoundResponse)
 	ModelsUsed        []string             // Unique models that contributed to intermediate stages
 	Iterations        int                  // Number of intermediate iterations executed
 	QuorumOutcome     *FusionQuorumOutcome // Quorum decision evidence (if fallback occurred)
