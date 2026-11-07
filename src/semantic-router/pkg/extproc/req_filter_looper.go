@@ -308,6 +308,13 @@ func (r *OpenAIRouter) finalizeLooperBufferedResponse(
 			"format":     reqCtx.SourceFormat,
 			"error":      err.Error(),
 		})
+		// Encoding failed, so an error response is returned instead of the
+		// recovered fallback.
+		// Promote the terminal disposition first, then route through the shared
+		// failure recorder. That helper is what actually creates the Replay
+		// record: the usage, status, body, and quorum writers all no-op while
+		// RouterReplayID is empty, so recording evidence without starting Replay
+		// would persist nothing and return no Replay ID header.
 		finalizeLooperQuorumOutcome(reqCtx, resp.QuorumOutcome, decision, false)
 		return r.recordLooperFailure(
 			reqCtx, originalModel, decision, 502,
@@ -324,6 +331,9 @@ func (r *OpenAIRouter) finalizeLooperBufferedResponse(
 	r.recordSuccessfulLooperExecution(
 		resp, originalModel, decision, reqCtx, semanticResponse, clientBody,
 	)
+	// Replay starts inside the recorder, so its ID only exists now. Attach it to
+	// the already-built immediate response, as the failure path does, otherwise a
+	// successful looper response omits the header for the record just created.
 	addRouterReplayHeaderToImmediateResponse(response, reqCtx.RouterReplayID)
 	return response, nil
 }
