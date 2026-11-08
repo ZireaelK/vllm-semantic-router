@@ -22,7 +22,7 @@ func (r *OpenAIRouter) buildReplayUsageCost(ctx *RequestContext, usage responseU
 		TotalTokens:        replayIntPtr(totalTokens),
 	}
 
-	if r == nil || r.Config == nil || ctx == nil || ctx.RequestModel == "" {
+	if r == nil || r.Config == nil || ctx == nil || ctx.RequestModel == "" || ctx.LooperStreamingActive {
 		return snapshot
 	}
 

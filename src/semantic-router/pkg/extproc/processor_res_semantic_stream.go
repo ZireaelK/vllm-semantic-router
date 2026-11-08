@@ -1,13 +1,15 @@
 package extproc
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/contextcompression"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/inflight"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/latency"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
@@ -150,11 +152,7 @@ func observeProtocolStream(
 			switch event.Type {
 			case llmprotocol.EventOutputTextDelta, llmprotocol.EventReasoningDelta:
 				if event.Delta != "" {
-					words := len(strings.Fields(event.Delta))
-					if words == 0 {
-						words = 1
-					}
-					ctx.LooperAuditedOutputTokens += words
+					ctx.LooperAuditedOutputTokens += contextcompression.EstimateTokens(event.Delta)
 				}
 			}
 		}
@@ -430,7 +428,46 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 	// Decoded stream events carry the client-facing model, not the provider's.
 	observeUpstreamResponse(ctx, "", usage)
 	r.reportSemanticStreamingUsage(ctx, completionLatency, usage)
-	r.calibrateTokenEstimator(ctx, usage.promptTokens)
+	if ctx.LooperStreamingActive {
+		if !usage.invalid {
+			ctx.LooperUsageSettled = true
+			logging.ComponentEvent("extproc", "looper_streaming_completed", map[string]interface{}{
+				"request_id":        ctx.RequestID,
+				"decision":          ctx.VSRSelectedDecisionName,
+				"algorithm":         ctx.VSRSelectionMethod,
+				"models_used":       ctx.LooperModelsUsed,
+				"iterations":        ctx.LooperIterations,
+				"selected_model":    firstNonEmpty(ctx.LooperTargetModel, ctx.VSRSelectedModel),
+				"prompt_tokens":     usage.promptTokens,
+				"completion_tokens": usage.completionTokens,
+				"total_tokens":      responseUsageTotal(usage),
+				"trace_recorded":    ctx.LooperTrace != nil,
+			})
+		} else {
+			abortErr := streamErr
+			if abortErr == nil {
+				abortErr = responseErr
+			}
+			r.settleAbortedLooperStreamingUsage(ctx, abortErr)
+		}
+	}
+
+	calibrationPromptTokens := usage.promptTokens
+	if ctx.LooperStreamingActive {
+		calibrationPromptTokens = 0
+		if ctx.SemanticResponse != nil {
+			synthesisUsage := responseUsageFromSemanticUsage(ctx.SemanticResponse.Usage)
+			if !synthesisUsage.invalid {
+				calibrationPromptTokens = synthesisUsage.promptTokens
+			}
+		}
+	}
+	r.calibrateTokenEstimatorForModel(
+		ctx,
+		calibrationTargetModel(ctx),
+		streamingCalibrationByteLen(ctx),
+		calibrationPromptTokens,
+	)
 
 	if responseErr != nil {
 		logging.ComponentWarnEvent("extproc", "neutral_stream_reconstruction_skipped", map[string]interface{}{
@@ -456,7 +493,38 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 	r.updateKVAddressRegistry(ctx)
 	r.scheduleSemanticResponseMemoryStore(ctx, semanticResponse)
 	r.persistResponseObject(ctx)
-	r.attachRouterReplayResponse(ctx, encoded, true)
+	r.attachRouterReplayResponse(ctx, attachLooperTraceToReplaySnapshot(ctx, encoded), true)
+}
+
+func streamingCalibrationByteLen(ctx *RequestContext) int {
+	if ctx == nil {
+		return 0
+	}
+	if ctx.LooperStreamingActive {
+		if ctx.LooperSynthesisTextBytes > 0 {
+			return ctx.LooperSynthesisTextBytes
+		}
+		return 0
+	}
+	return tokenCalibrationByteLen(ctx)
+}
+
+func attachLooperTraceToReplaySnapshot(ctx *RequestContext, encoded []byte) []byte {
+	if ctx == nil || !ctx.LooperStreamingActive || ctx.LooperTrace == nil || len(encoded) == 0 {
+		return encoded
+	}
+	traceJSON, err := json.Marshal(ctx.LooperTrace)
+	if err != nil || len(traceJSON) == 0 || string(traceJSON) == "null" {
+		return encoded
+	}
+	field := "looper_trace"
+	switch ctx.VSRSelectionMethod {
+	case config.DecisionAlgorithmFusion:
+		field = "fusion"
+	case config.DecisionAlgorithmWorkflows:
+		field = "flow"
+	}
+	return restoreLooperFieldJSON(encoded, traceJSON, field)
 }
 
 func (r *OpenAIRouter) reportSemanticStreamingUsage(

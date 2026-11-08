@@ -20,11 +20,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/openai/openai-go"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/headers"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/looper"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
@@ -215,7 +217,7 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 		), nil
 	}
 
-	mutatedBody, err := json.Marshal(plan.SynthesisParams)
+	rawSynthesisBody, err := json.Marshal(plan.SynthesisParams)
 	if err != nil {
 		finalizeLooperQuorumOutcome(reqCtx, plan.QuorumOutcome, decision, false)
 		return r.recordLooperFailure(
@@ -231,12 +233,19 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 		), nil
 	}
 
-	mutatedBody, err = looper.SetStreamParam(mutatedBody, true)
+	targetModel := strings.TrimSpace(plan.TargetModel)
+	if targetModel == "" && plan.SynthesisParams != nil {
+		targetModel = strings.TrimSpace(plan.SynthesisParams.Model)
+	}
+
+	dispatchResponse, synthesisTextBytes, err := r.buildLooperStreamingDispatchResponse(
+		rawSynthesisBody, targetModel, decision, reqCtx,
+	)
 	if err != nil {
 		finalizeLooperQuorumOutcome(reqCtx, plan.QuorumOutcome, decision, false)
 		return r.recordLooperFailure(
 			reqCtx, originalModel, decision, 502,
-			"Looper streaming set stream param failed", "looper_stream_param_failed",
+			"Looper streaming dispatch encoding failed", "looper_stream_dispatch_encode_failed",
 			looperFailureEvidence{
 				algorithm:    decision.Algorithm.Type,
 				modelsUsed:   plan.ModelsUsed,
@@ -246,44 +255,135 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 			},
 		), nil
 	}
+	if dispatchResponse.GetImmediateResponse() != nil {
+		finalizeLooperQuorumOutcome(reqCtx, plan.QuorumOutcome, decision, false)
+		return dispatchResponse, nil
+	}
 
 	// Update RequestContext state for subsequent response stream handling and audit
 	reqCtx.LooperStreamingActive = true
+	reqCtx.LooperTargetModel = targetModel
+	reqCtx.LooperSynthesisTextBytes = synthesisTextBytes
 	reqCtx.LooperIntermediateUsage = plan.IntermediateUsage
 	reqCtx.LooperTrace = plan.Trace
 	reqCtx.LooperModelsUsed = plan.ModelsUsed
-	reqCtx.LooperQuorumOutcome = plan.QuorumOutcome
-	reqCtx.VSRSelectedModel = plan.TargetModel
+	reqCtx.LooperIterations = plan.Iterations
+	reqCtx.ResponsePath = headers.ResponsePathLooper
+	reqCtx.VSRSelectedModel = targetModel
 	reqCtx.RequestModel = originalModel // Preserve client's original requested model for rewrite & accounting
 	reqCtx.VSRSelectionMethod = decision.Algorithm.Type
 
 	finalizeLooperQuorumOutcome(reqCtx, plan.QuorumOutcome, decision, true)
 
 	// Start replay so downstream stream completion or cancellation can record usage and lifecycle
-	r.startRouterReplay(reqCtx, originalModel, plan.TargetModel, decision.Name)
+	r.startRouterReplay(reqCtx, originalModel, targetModel, decision.Name)
 
-	state := &routeHeaderState{
-		removeHeaders: []string{"content-length"},
-	}
-	appendRoutingHeaders(&state.setHeaders, plan.TargetModel)
-	appendContentLengthHeader(&state.setHeaders, len(mutatedBody))
-	r.applyDecisionHeaderMutations(state, reqCtx)
-
-	bodyMutation := &ext_proc.BodyMutation{
-		Mutation: &ext_proc.BodyMutation_Body{
-			Body: mutatedBody,
-		},
-	}
-
+	mutatedBody := dispatchResponse.GetRequestBody().GetResponse().GetBodyMutation().GetBody()
 	logging.ComponentDebugEvent("extproc", "looper_streaming_dispatch_prepared", map[string]interface{}{
 		"request_id":     reqCtx.RequestID,
 		"original_model": originalModel,
-		"target_model":   plan.TargetModel,
+		"target_model":   targetModel,
 		"decision":       decision.Name,
 		"body_bytes":     len(mutatedBody),
 	})
 
-	return buildRequestBodyContinueResponse(state, bodyMutation, r.shouldClearRouteCache()), nil
+	return dispatchResponse, nil
+}
+
+func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
+	rawSynthesisBody []byte,
+	targetModel string,
+	decision *config.Decision,
+	reqCtx *RequestContext,
+) (*ext_proc.ProcessingResponse, int, error) {
+	engine, err := r.protocolEngine()
+	if err != nil {
+		return nil, 0, err
+	}
+	clientOptions := clientStreamOptions(reqCtx)
+	synthesisReq, _, _, err := engine.DecodeRequest(llmprotocol.OpenAIChatV1, rawSynthesisBody)
+	if err != nil {
+		return nil, 0, err
+	}
+	synthesisReq.Stream = true
+	synthesisReq.StreamOptions = clientOptions
+	synthesisReq.Generation++
+	synthesisTextBytes := extractSemanticRequestSignals(&synthesisReq).ContextTextBytes
+
+	// Retire the client's raw byte-replay envelope because the outgoing payload
+	// is now the synthesized/fallback stage request.
+	reqCtx.ProtocolEnvelope = llmprotocol.Envelope{}
+
+	useReasoning, reasoningEffort := r.getReasoningInfoFromDecision(decision, targetModel)
+	applyLooperReasoningContext(reqCtx, targetModel, useReasoning, reasoningEffort)
+
+	backendModel := reqCtx.backendModelForCandidate(targetModel)
+	_, _, hasConfiguredBackend, _ := r.Config.ResolvePrimaryBackendForModel(backendModel)
+	if hasConfiguredBackend || r.Config.Looper.Endpoint == "" {
+		dispatch, prepErr := r.prepareProviderDispatch(&synthesisReq, targetModel, "", useReasoning, reqCtx)
+		if prepErr != nil {
+			return nil, 0, prepErr
+		}
+		// Keep decision stage controls for final provider adaptation without
+		// re-inserting the semantic system prompt onto the synthesis request.
+		dispatch.decisionName = decision.Name
+		reqCtx.SemanticRequest.Stream = true
+		response := r.buildProviderDispatchResponse(dispatch, reqCtx)
+		if response.GetImmediateResponse() != nil {
+			return response, synthesisTextBytes, nil
+		}
+		finalized, finErr := r.finalizeProviderDispatchResponse(dispatch, response, reqCtx)
+		return finalized, synthesisTextBytes, finErr
+	}
+
+	// Legacy Looper.Endpoint-only test fixtures have no VLLMEndpoints; still
+	// route through encodeDispatchRequest and routeHeaderState so include_usage,
+	// external model mapping, credentials, and headers remain uniform.
+	targetFormat, fmtErr := wireFormatForModel(r.Config.GetModelAPIFormat(backendModel))
+	if fmtErr != nil {
+		targetFormat = llmprotocol.OpenAIChatV1
+	}
+	dispatch := &providerDispatch{
+		logicalModel:  targetModel,
+		backendModel:  backendModel,
+		upstreamModel: r.Config.ResolveExternalModelID(targetModel, ""),
+		targetFormat:  targetFormat,
+		decisionName:  decision.Name,
+		useReasoning:  useReasoning,
+	}
+	synthesisReq.Model = dispatch.upstreamModel
+	synthesisReq.Stream = true
+	synthesisReq.Generation++
+	reqCtx.TargetFormat = dispatch.targetFormat
+	reqCtx.SemanticRequest = &synthesisReq
+	reqCtx.RequestModel = dispatch.logicalModel
+	reqCtx.VSRSelectedModel = dispatch.logicalModel
+
+	state := &routeHeaderState{
+		setHeaders:    r.startUpstreamSpanAndInjectHeaders(dispatch, reqCtx),
+		removeHeaders: []string{"content-length"},
+	}
+	if r.CredentialResolver != nil {
+		if credErr := r.appendProviderCredential(state, dispatch.effectiveBackendModel(), "", reqCtx); credErr != nil {
+			return credErr, synthesisTextBytes, nil
+		}
+	}
+	appendRoutingHeaders(&state.setHeaders, dispatch.effectiveBackendModel())
+	setProviderRequestPath(&state.setHeaders, nil, dispatch.targetFormat)
+	r.applyDecisionHeaderMutations(state, reqCtx)
+
+	mutatedBody, err := r.encodeDispatchRequest(reqCtx)
+	if err != nil {
+		return nil, 0, err
+	}
+	mutatedBody, err = r.adaptProviderRequest(mutatedBody, dispatch, reqCtx)
+	if err != nil {
+		return nil, 0, err
+	}
+	appendContentLengthHeader(&state.setHeaders, len(mutatedBody))
+	response := buildRequestBodyContinueResponse(state, nil, r.shouldClearRouteCache())
+	bindPreparedDispatchArtifact(response.GetRequestBody().GetResponse(), reqCtx, mutatedBody, dispatch.targetFormat)
+	return response, synthesisTextBytes, nil
 }
 
 func (r *OpenAIRouter) finalizeLooperBufferedResponse(

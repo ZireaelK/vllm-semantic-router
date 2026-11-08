@@ -430,12 +430,15 @@ type RequestContext struct {
 	Hop                       *routing.Hop                // The routing context of a hop served in process
 	LooperIteration           int                         // The iteration number if this is a looper request
 	LooperLogprobs            *looperLogprobOptions       // Native Chat evidence requested by an authenticated internal hop
-	LooperStreamingActive     bool                        // True when a native streaming final stage is dispatched through Envoy
-	LooperIntermediateUsage   looper.TokenUsage           // Token usage accumulated from intermediate panel/analysis stages
-	LooperTrace               any                         // Execution trace from intermediate stages (e.g. *looper.FusionTrace, *workflowTrace, []RoundResponse)
-	LooperModelsUsed          []string                    // All model identifiers used across intermediate panel stages
-	LooperQuorumOutcome       *looper.FusionQuorumOutcome // Bounded quorum outcome evidence (e.g. for fallback)
-	LooperAuditedOutputTokens int                         // Estimated output tokens audited from SSE deltas before disconnect
+	LooperStreamingActive     bool              // True when a native streaming final stage is dispatched through Envoy
+	LooperTargetModel         string            // Physical target model executing the streamed final stage
+	LooperSynthesisTextBytes  int               // Semantic text bytes of the dispatched synthesis request for token calibration
+	LooperIntermediateUsage   looper.TokenUsage // Token usage accumulated from intermediate panel/analysis stages
+	LooperTrace               any               // Execution trace from intermediate stages (e.g. *looper.FusionTrace, *workflowTrace, []RoundResponse)
+	LooperModelsUsed          []string          // All model identifiers used across intermediate panel stages
+	LooperIterations          int               // Intermediate execution call/iteration count
+	LooperAuditedOutputTokens int               // Estimated output tokens audited from SSE deltas before disconnect
+	LooperUsageSettled        bool              // True once terminal or aborted Looper streaming usage has been settled
 
 	// ListenerModels, when set, are the only request models the listener the
 	// client request arrived on accepts.

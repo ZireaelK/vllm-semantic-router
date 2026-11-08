@@ -336,11 +336,25 @@ func buildResponseHeaderMutation(
 	// so demoting the wire header does not change behavior.
 	addFinalDecisionHeaders(builder, ctx)
 	if debugHeadersRequested(ctx) {
+		addLooperStreamingDebugHeaders(builder, ctx)
 		addRetentionDirectiveHeaders(builder, ctx)
 		addDecisionDetailHeaders(builder, ctx)
 		addMatchedSignalHeaders(builder, ctx)
 	}
 	return builder.mutation()
+}
+
+func addLooperStreamingDebugHeaders(builder *responseHeaderMutationBuilder, ctx *RequestContext) {
+	if ctx == nil || !ctx.LooperStreamingActive {
+		return
+	}
+	builder.addString(headers.VSRLooperModel, firstNonEmpty(ctx.LooperTargetModel, ctx.VSRSelectedModel))
+	builder.addJoined(headers.VSRLooperModelsUsed, ctx.LooperModelsUsed)
+	builder.addInt(headers.VSRLooperIterations, ctx.LooperIterations)
+	builder.addString(headers.VSRLooperAlgorithm, ctx.VSRSelectionMethod)
+	builder.addInt(headers.VSRLooperPromptTokens, int(ctx.LooperIntermediateUsage.PromptTokens))
+	builder.addInt(headers.VSRLooperCompletionTokens, int(ctx.LooperIntermediateUsage.CompletionTokens))
+	builder.addInt(headers.VSRLooperTotalTokens, int(ctx.LooperIntermediateUsage.TotalTokens))
 }
 
 // addRetentionDirectiveHeaders emits the matched decision's EMIT retention
