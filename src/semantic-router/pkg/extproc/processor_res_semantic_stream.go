@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
@@ -18,6 +19,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/protocolcodec"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/ratelimit"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/sessiontelemetry"
 )
 
 // semanticResponseStreamState is request-scoped reconstruction state for
@@ -148,16 +150,40 @@ func observeProtocolStream(
 		recordProtocolDiagnostic(ctx, normalizeProtocol(string(ctx.SourceFormat)), normalizeProtocol(string(ctx.TargetFormat)), diagnostic)
 	}
 	ctx.SemanticStreamState.observe(events)
-	if ctx != nil && ctx.LooperStreamingActive {
-		for _, event := range events {
-			switch event.Type {
-			case llmprotocol.EventOutputTextDelta, llmprotocol.EventReasoningDelta:
-				if event.Delta != "" {
-					ctx.LooperAuditedOutputTokens += contextcompression.EstimateTokens(event.Delta)
-				}
+}
+
+func estimateAbortedLooperOutputTokens(state *semanticResponseStreamState) int {
+	if state == nil || len(state.items) == 0 {
+		return 0
+	}
+	var b strings.Builder
+	for _, item := range state.items {
+		if item == nil {
+			continue
+		}
+		if item.text != "" {
+			b.WriteString(item.text)
+		}
+		if item.reasoning != "" {
+			b.WriteString(item.reasoning)
+		}
+		if item.refusal != "" {
+			b.WriteString(item.refusal)
+		}
+		if item.toolCall != nil {
+			if item.toolCall.Name != "" {
+				b.WriteString(item.toolCall.Name)
+			}
+			if item.toolCall.Arguments != "" {
+				b.WriteString(item.toolCall.Arguments)
 			}
 		}
 	}
+	combined := b.String()
+	if combined == "" {
+		return 0
+	}
+	return contextcompression.EstimateTokens(combined)
 }
 
 // failureFrame returns the frame the encoder wrote for an upstream failure in
@@ -209,7 +235,9 @@ func recordStreamingTTFT(ctx *RequestContext) {
 	metrics.RecordModelFirstResponseObservation(ctx.RequestModel, ttft)
 	ctx.TTFTSeconds = ttft
 	ctx.TTFTRecorded = true
-	latency.UpdateTTFT(ctx.RequestModel, ttft)
+	if !ctx.LooperStreamingActive {
+		latency.UpdateTTFT(ctx.RequestModel, ttft)
+	}
 	ctx.CacheWarmthEstimate = latency.EstimateCacheProbability(latency.CacheEstimationInput{
 		Model:       ctx.RequestModel,
 		TTFTSeconds: ttft,
@@ -495,7 +523,9 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 		r.recordUnscheduledResponseMemoryStore(ctx, "skipped", "stream_encode_failed", true)
 		return
 	}
-	r.updateResponseCache(ctx, encoded)
+	if !ctx.LooperStreamingActive {
+		r.updateResponseCache(ctx, encoded)
+	}
 	r.updateKVAddressRegistry(ctx)
 	r.scheduleSemanticResponseMemoryStore(ctx, semanticResponse)
 	r.persistResponseObject(ctx)
@@ -541,7 +571,11 @@ func (r *OpenAIRouter) reportSemanticStreamingUsage(
 	if ctx == nil {
 		return
 	}
-	recordSessionTurnOutcome(ctx, usage, r.sessionTurnPricing(ctx.RequestModel))
+	pricing := r.sessionTurnPricing(ctx.RequestModel)
+	if ctx.LooperStreamingActive {
+		pricing = sessiontelemetry.TurnPricing{}
+	}
+	recordSessionTurnOutcome(ctx, usage, pricing)
 	if usage.invalid {
 		return
 	}
@@ -554,12 +588,14 @@ func (r *OpenAIRouter) reportSemanticStreamingUsage(
 		})
 	}
 	if totalTokens > 0 {
-		recordSessionTurn(ctx, usage, r.sessionTurnPricing(ctx.RequestModel))
+		recordSessionTurn(ctx, usage, pricing)
 	}
 	if ctx.RequestModel == "" {
 		return
 	}
-	recordModelUsageTokens(ctx.RequestModel, usage)
+	if !ctx.LooperStreamingActive {
+		recordModelUsageTokens(ctx.RequestModel, usage)
+	}
 	metrics.RecordModelWindowedRequest(
 		ctx.RequestModel,
 		completionLatency.Seconds(),
@@ -569,7 +605,9 @@ func (r *OpenAIRouter) reportSemanticStreamingUsage(
 	if usage.completionTokens > 0 && completionLatency > 0 {
 		timePerToken := completionLatency.Seconds() / float64(usage.completionTokens)
 		metrics.RecordModelResponseDurationPerOutputToken(ctx.RequestModel, timePerToken)
-		latency.UpdateTPOT(ctx.RequestModel, timePerToken)
+		if !ctx.LooperStreamingActive {
+			latency.UpdateTPOT(ctx.RequestModel, timePerToken)
+		}
 	}
 	replayUsage := r.recordResponseCost(ctx, completionLatency, usage)
 	r.updateRouterReplayUsageCost(ctx, replayUsage)

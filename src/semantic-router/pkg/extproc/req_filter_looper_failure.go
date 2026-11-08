@@ -87,8 +87,16 @@ func looperFailureEvidenceFromError(err error) (looperFailureEvidence, bool) {
 	}
 	if outcome, ok := looper.FusionQuorumOutcomeFromError(err); ok {
 		evidence, _ := looper.FusionQuorumEvidenceFromError(err)
+		modelsUsed := make([]string, 0, len(evidence.Attempts))
+		for _, att := range evidence.Attempts {
+			if att.Model != "" {
+				modelsUsed = append(modelsUsed, att.Model)
+			}
+		}
 		return looperFailureEvidence{
 			algorithm:    config.DecisionAlgorithmFusion,
+			modelsUsed:   modelsUsed,
+			iterations:   len(modelsUsed),
 			usage:        evidence.Usage,
 			fusionQuorum: outcome,
 		}, true
@@ -155,6 +163,28 @@ func (r *OpenAIRouter) recordLooperFailure(
 	reason string,
 	executionEvidence ...looperFailureEvidence,
 ) *ext_proc.ProcessingResponse {
+	return r.recordLooperFailureWithLifecycle(
+		ctx,
+		originalModel,
+		decision,
+		statusCode,
+		message,
+		routerreplay.LifecycleFailed,
+		reason,
+		executionEvidence...,
+	)
+}
+
+func (r *OpenAIRouter) recordLooperFailureWithLifecycle(
+	ctx *RequestContext,
+	originalModel string,
+	decision *config.Decision,
+	statusCode int,
+	message string,
+	lifecycleState string,
+	reason string,
+	executionEvidence ...looperFailureEvidence,
+) *ext_proc.ProcessingResponse {
 	response := r.createErrorResponse(statusCode, message)
 	decisionName := ""
 	if decision != nil {
@@ -172,8 +202,33 @@ func (r *OpenAIRouter) recordLooperFailure(
 	if immediate := response.GetImmediateResponse(); immediate != nil {
 		r.attachRouterReplayResponse(ctx, immediate.Body, false)
 	}
-	r.finalizeRouterReplay(ctx, routerreplay.LifecycleFailed, reason)
+	r.finalizeRouterReplay(ctx, lifecycleState, reason)
 	addRouterReplayHeaderToImmediateResponse(response, ctx.RouterReplayID)
+
+	if len(executionEvidence) > 0 {
+		ev := executionEvidence[0]
+		if ev.usage.PromptTokens > 0 || ev.usage.CompletionTokens > 0 {
+			recordSessionTurn(ctx, responseUsageMetrics{
+				promptTokens:     int(ev.usage.PromptTokens),
+				completionTokens: int(ev.usage.CompletionTokens),
+			}, sessiontelemetry.TurnPricing{})
+			logging.LogEvent("llm_usage", map[string]interface{}{
+				"request_id":                     ctx.RequestID,
+				"model":                          originalModel,
+				"decision":                       decisionName,
+				"prompt_tokens":                  ev.usage.PromptTokens,
+				"completion_tokens":              ev.usage.CompletionTokens,
+				"total_tokens":                   ev.usage.TotalTokens,
+				"cost":                           0.0,
+				"currency":                       "unknown",
+				"pricing":                        "looper_immediate_rejected_unpriced",
+				"intermediate_prompt_tokens":     ev.usage.PromptTokens,
+				"intermediate_completion_tokens": ev.usage.CompletionTokens,
+				"looper_models_used":             ev.modelsUsed,
+				"looper_iterations":              ev.iterations,
+			})
+		}
+	}
 	return response
 }
 

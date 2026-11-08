@@ -119,7 +119,7 @@ func (l *FusionLooper) PrepareStreamingSynthesis(
 		IntermediateUsage: intermediateUsage,
 		Trace:             trace,
 		ModelsUsed:        modelsUsed,
-		Iterations:        iterations,
+		Iterations:        iterations + 1,
 		QuorumOutcome:     nil,
 	}, nil
 }
@@ -172,6 +172,13 @@ func (l *FusionLooper) applyStreamingQuorumFailurePolicy(
 
 	if fallbackReq != nil {
 		fallbackReq.Model = target
+		if cfg.Temperature != nil {
+			fallbackReq.Temperature = openai.Float(*cfg.Temperature)
+		}
+		if cfg.MaxCompletionTokens > 0 {
+			fallbackReq.MaxTokens = (openai.ChatCompletionNewParams{}).MaxTokens
+			fallbackReq.MaxCompletionTokens = openai.Int(int64(cfg.MaxCompletionTokens))
+		}
 	}
 
 	modelsUsed := append(append([]string{}, panel.dispatchedModels...), target)

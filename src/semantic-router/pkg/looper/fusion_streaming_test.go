@@ -132,7 +132,7 @@ func TestPrepareStreamingSynthesis_SeparateAnalysisMode(t *testing.T) {
 	// Verify synthesis params
 	assert.Equal(t, "judge", plan.TargetModel)
 	assert.Equal(t, "judge", string(plan.SynthesisParams.Model))
-	assert.Equal(t, 3, plan.Iterations)
+	assert.Equal(t, 4, plan.Iterations)
 }
 
 func TestPrepareStreamingSynthesis_QuorumFallback(t *testing.T) {
@@ -142,6 +142,7 @@ func TestPrepareStreamingSynthesis_QuorumFallback(t *testing.T) {
 	})
 	defer server.Close()
 
+	temp := 0.5
 	req := newFusionTestRequest()
 	req.IsStreaming = true
 	req.Algorithm = &config.AlgorithmConfig{
@@ -151,6 +152,8 @@ func TestPrepareStreamingSynthesis_QuorumFallback(t *testing.T) {
 			AnalysisModels:       []string{"panel-a", "panel-b"},
 			QuorumFailurePolicy:  config.FusionQuorumFailurePolicyFallback,
 			QuorumFallbackTarget: "backup-model",
+			Temperature:          &temp,
+			MaxCompletionTokens:  512,
 		},
 	}
 
@@ -162,6 +165,8 @@ func TestPrepareStreamingSynthesis_QuorumFallback(t *testing.T) {
 	// Fallback target is selected for direct upstream streaming
 	assert.Equal(t, "backup-model", plan.TargetModel)
 	assert.Equal(t, "backup-model", string(plan.SynthesisParams.Model))
+	assert.Equal(t, temp, plan.SynthesisParams.Temperature.Value)
+	assert.Equal(t, int64(512), plan.SynthesisParams.MaxCompletionTokens.Value)
 
 	// Quorum outcome evidence is preserved
 	require.NotNil(t, plan.QuorumOutcome)

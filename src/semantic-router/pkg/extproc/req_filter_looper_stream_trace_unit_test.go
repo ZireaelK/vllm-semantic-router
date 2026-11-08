@@ -631,19 +631,85 @@ func TestObserveProtocolStream_CJKAbortAccumulatesEstimatedTokens(t *testing.T) 
 			CompletionTokens: 10,
 			TotalTokens:      30,
 		},
+		SemanticStreamState: &semanticResponseStreamState{
+			items: make(map[int]*semanticStreamItem),
+		},
 	}
 	router.startRouterReplay(reqCtx, "router-entrypoint", "judge", "fusion-stream")
 
 	observeProtocolStream(reqCtx, []llmprotocol.Event{
 		{Type: llmprotocol.EventOutputTextDelta, Delta: cjkSentence},
 	}, nil)
-	require.Equal(t, expectedTokens, reqCtx.LooperAuditedOutputTokens)
 
 	require.NoError(t, router.handleProcessReceiveError(reqCtx, context.Canceled))
 	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
 	require.True(t, ok)
 	require.NotNil(t, record.CompletionTokens)
 	require.Equal(t, 10+expectedTokens, *record.CompletionTokens)
+}
+
+func TestSettleAbortedLooperStreamingUsage_IncludesToolCallsAndAvoidsChunkInflation(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{Enabled: true},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	toolName := "get_weather"
+	toolArgs := `{"location": "Hangzhou, Zhejiang", "unit": "celsius"}`
+	combinedText := toolName + toolArgs
+	expectedTokens := contextcompression.EstimateTokens(combinedText)
+
+	reqCtx := &RequestContext{
+		RequestID:                "req-tool-stream-abort",
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &replayConfig,
+		IsStreamingResponse:      true,
+		LooperStreamingActive:    true,
+		LooperIntermediateUsage: looper.TokenUsage{
+			PromptTokens:     20,
+			CompletionTokens: 5,
+			TotalTokens:      25,
+		},
+		SemanticStreamState: &semanticResponseStreamState{
+			items: make(map[int]*semanticStreamItem),
+		},
+	}
+	router.startRouterReplay(reqCtx, "router-entrypoint", "judge", "fusion-stream")
+
+	// Emit tool call across multiple small delta chunks
+	observeProtocolStream(reqCtx, []llmprotocol.Event{
+		{
+			Type:      llmprotocol.EventToolCallDelta,
+			ItemIndex: 0,
+			ToolCall:  &llmprotocol.ToolCall{Name: toolName},
+		},
+		{
+			Type:      llmprotocol.EventToolCallDelta,
+			ItemIndex: 0,
+			ToolCall:  &llmprotocol.ToolCall{Arguments: `{"location":`},
+		},
+		{
+			Type:      llmprotocol.EventToolCallDelta,
+			ItemIndex: 0,
+			ToolCall:  &llmprotocol.ToolCall{Arguments: ` "Hangzhou, Zhejiang",`},
+		},
+		{
+			Type:      llmprotocol.EventToolCallDelta,
+			ItemIndex: 0,
+			ToolCall:  &llmprotocol.ToolCall{Arguments: ` "unit": "celsius"}`},
+		},
+	}, nil)
+
+	require.NoError(t, router.handleProcessReceiveError(reqCtx, context.Canceled))
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.NotNil(t, record.CompletionTokens)
+	require.Equal(t, 5+expectedTokens, *record.CompletionTokens)
 }
 
 func replayInt64Ptr(v int64) *int64 {
@@ -835,4 +901,142 @@ func TestFinalizeSemanticStreamingResponse_AbnormalStreamSetsLifecycleFailed(t *
 		require.Equal(t, routerreplay.LifecycleFailed, recordAfterCancel.LifecycleState)
 		require.Equal(t, "upstream_stream_incomplete", recordAfterCancel.TerminalReason)
 	})
+}
+
+func TestLooperStreaming_ShouldStreamLooperFinalStageGate(t *testing.T) {
+	enabledFalse := false
+	routerDisabled := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			Looper: config.LooperConfig{
+				Streaming: config.LooperStreamingConfig{Enabled: &enabledFalse},
+			},
+		},
+	}
+	routerEnabled := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			Looper: config.LooperConfig{
+				Streaming: config.LooperStreamingConfig{Enabled: nil}, // default true
+			},
+		},
+	}
+
+	reqCtx := &RequestContext{
+		ExpectStreamingResponse: true,
+		SourceFormat:            llmprotocol.OpenAIChatV1,
+	}
+	request := &llmprotocol.Request{Stream: true}
+	ownership := looper.StageOwnership{Eligibility: looper.StreamingEligible}
+
+	fusionDecision := &config.Decision{
+		Algorithm: &config.AlgorithmConfig{Type: config.DecisionAlgorithmFusion},
+	}
+	confidenceDecision := &config.Decision{
+		Algorithm: &config.AlgorithmConfig{Type: config.DecisionAlgorithmConfidence},
+	}
+
+	// Gate disabled -> false
+	require.False(t, routerDisabled.shouldStreamLooperFinalStage(ownership, reqCtx, request, fusionDecision))
+
+	// Non-fusion algorithm -> false
+	require.False(t, routerEnabled.shouldStreamLooperFinalStage(ownership, reqCtx, request, confidenceDecision))
+
+	// Fusion algorithm and enabled -> true
+	require.True(t, routerEnabled.shouldStreamLooperFinalStage(ownership, reqCtx, request, fusionDecision))
+}
+
+func TestLooperStreaming_BlocksOuterFallbackAndSettlesUpstreamTransportError(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{Enabled: true},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	reqCtx := &RequestContext{
+		RequestID:                "req-transport-err",
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &replayConfig,
+		LooperStreamingActive:    true,
+		UpstreamStatusCode:       502,
+		LooperIntermediateUsage: looper.TokenUsage{
+			PromptTokens:     100,
+			CompletionTokens: 50,
+			TotalTokens:      150,
+		},
+	}
+
+	// 1. Blocks outer fallback
+	require.False(t, router.shouldAttemptFallback(reqCtx))
+
+	// 2. Upstream transport error settles intermediate usage before attaching replay response
+	router.startRouterReplay(reqCtx, "entrypoint", "judge", "fusion-stream")
+	_ = router.handleUpstreamTransportError([]byte(`{"error":"bad gateway"}`), reqCtx)
+
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+	require.Equal(t, "upstream_error_response", record.TerminalReason)
+	require.NotNil(t, record.PromptTokens)
+	require.Equal(t, 100, *record.PromptTokens)
+	require.NotNil(t, record.CompletionTokens)
+	require.Equal(t, 50, *record.CompletionTokens)
+}
+
+func TestLooperStreaming_PrepareCancelledRecordsLifecycleAborted(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{Enabled: true},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	reqCtx := &RequestContext{
+		RequestID:                "req-prepare-cancel",
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &replayConfig,
+	}
+
+	decision := &config.Decision{
+		Name:      "fusion-stream",
+		Algorithm: &config.AlgorithmConfig{Type: config.DecisionAlgorithmFusion},
+	}
+
+	evidence := looperFailureEvidence{
+		algorithm:  decision.Algorithm.Type,
+		modelsUsed: []string{"panel-a"},
+		iterations: 1,
+		usage: looper.TokenUsage{
+			PromptTokens:     40,
+			CompletionTokens: 20,
+			TotalTokens:      60,
+		},
+	}
+
+	resp := router.recordLooperFailureWithLifecycle(
+		reqCtx, "entrypoint", decision, 499,
+		"Client cancelled during looper prepare",
+		routerreplay.LifecycleAborted,
+		"client_cancelled_during_looper_prepare",
+		evidence,
+	)
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.GetImmediateResponse())
+
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, 499, record.ResponseStatus)
+	require.Equal(t, routerreplay.LifecycleAborted, record.LifecycleState)
+	require.Equal(t, "client_cancelled_during_looper_prepare", record.TerminalReason)
+	require.NotNil(t, record.PromptTokens)
+	require.Equal(t, 40, *record.PromptTokens)
+	require.NotNil(t, record.CompletionTokens)
+	require.Equal(t, 20, *record.CompletionTokens)
 }

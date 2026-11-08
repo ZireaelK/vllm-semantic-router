@@ -2604,6 +2604,8 @@ global:
       timeout_seconds: 120
       headers:
         X-Trace-Source: looper
+      streaming:
+        enabled: true
       flow:
         state:
           store_backend: file

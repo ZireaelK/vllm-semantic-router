@@ -190,6 +190,10 @@ func (r *OpenAIRouter) settleAbortedLooperStreamingUsage(ctx *RequestContext, er
 		recordSessionTurnOutcome(ctx, responseUsageMetrics{})
 	}
 
+	if estimated := estimateAbortedLooperOutputTokens(ctx.SemanticStreamState); estimated > 0 {
+		ctx.LooperAuditedOutputTokens += estimated
+	}
+
 	promptTokens := int(ctx.LooperIntermediateUsage.PromptTokens)
 	completionTokens := int(ctx.LooperIntermediateUsage.CompletionTokens) + ctx.LooperAuditedOutputTokens
 	totalTokens := promptTokens + completionTokens
@@ -209,10 +213,15 @@ func (r *OpenAIRouter) settleAbortedLooperStreamingUsage(ctx *RequestContext, er
 	}
 
 	abortStage := "response_stream"
-	if !ctx.IsStreamingResponse {
+	if ctx.UpstreamStatusCode >= 400 {
+		abortStage = "upstream_error_response"
+	} else if !ctx.IsStreamingResponse {
 		abortStage = "upstream_prefill"
 	}
-	_, abortReason := replayLifecycleForReceiveError(err)
+	abortReason := "upstream_response_failed"
+	if ctx.UpstreamStatusCode < 400 {
+		_, abortReason = replayLifecycleForReceiveError(err)
+	}
 	completionLatency := time.Duration(0)
 	if !ctx.StartTime.IsZero() {
 		completionLatency = time.Since(ctx.StartTime)

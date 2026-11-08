@@ -32,6 +32,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/protocolcodec"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/selection"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/sessiontelemetry"
 )
 
@@ -130,7 +131,7 @@ func (r *OpenAIRouter) handleLooperExecution(
 	}
 
 	ownership := looper.ResolveFinalStageOwnership(looperReq)
-	if r.shouldStreamLooperFinalStage(ownership, reqCtx, request) {
+	if r.shouldStreamLooperFinalStage(ownership, reqCtx, request, decision) {
 		return r.handleLooperStreamingDispatch(ctx, looperReq, decision, request.Model, reqCtx)
 	}
 
@@ -142,7 +143,18 @@ func (r *OpenAIRouter) handleLooperExecution(
 	return r.finalizeLooperBufferedResponse(resp, decision, request.Model, reqCtx)
 }
 
-func (r *OpenAIRouter) shouldStreamLooperFinalStage(ownership looper.StageOwnership, reqCtx *RequestContext, request *llmprotocol.Request) bool {
+func (r *OpenAIRouter) shouldStreamLooperFinalStage(
+	ownership looper.StageOwnership,
+	reqCtx *RequestContext,
+	request *llmprotocol.Request,
+	decision *config.Decision,
+) bool {
+	if r != nil && r.Config != nil && !r.Config.Looper.IsStreamingEnabled() {
+		return false
+	}
+	if decision == nil || decision.Algorithm == nil || decision.Algorithm.Type != config.DecisionAlgorithmFusion {
+		return false
+	}
 	if reqCtx == nil || !reqCtx.ExpectStreamingResponse {
 		return false
 	}
@@ -196,24 +208,34 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 			"algorithm":  decision.Algorithm.Type,
 			"error":      err.Error(),
 		})
-		statusCode := 502
-		reason := "looper_streaming_prepare_failed"
-		if errors.Is(err, context.DeadlineExceeded) {
-			statusCode = 504
-			reason = "looper_streaming_deadline_exceeded"
+		evidence, _ := looperFailureEvidenceFromError(err)
+		if evidence.algorithm == "" && decision != nil && decision.Algorithm != nil {
+			evidence.algorithm = decision.Algorithm.Type
 		}
 		var quorumOutcome *looper.FusionQuorumOutcome
 		if outcome, ok := looper.FusionQuorumOutcomeFromError(err); ok {
 			quorumOutcome = outcome
+			evidence.fusionQuorum = quorumOutcome
 		}
 		finalizeLooperQuorumOutcome(reqCtx, quorumOutcome, decision, false)
-		return r.recordLooperFailure(
+
+		statusCode := 502
+		lifecycleState := routerreplay.LifecycleFailed
+		reason := "looper_streaming_prepare_failed"
+
+		if errors.Is(err, context.Canceled) || (quorumOutcome != nil && quorumOutcome.Disposition == looper.FusionQuorumCancelled) {
+			statusCode = 499
+			lifecycleState = routerreplay.LifecycleAborted
+			reason = "client_cancelled_during_looper_prepare"
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			statusCode = 504
+			reason = "looper_streaming_deadline_exceeded"
+		}
+
+		return r.recordLooperFailureWithLifecycle(
 			reqCtx, originalModel, decision, statusCode,
-			"Looper intermediate execution failed", reason,
-			looperFailureEvidence{
-				algorithm:    decision.Algorithm.Type,
-				fusionQuorum: quorumOutcome,
-			},
+			"Looper intermediate execution failed", lifecycleState, reason,
+			evidence,
 		), nil
 	}
 
@@ -243,9 +265,26 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 	)
 	if err != nil {
 		finalizeLooperQuorumOutcome(reqCtx, plan.QuorumOutcome, decision, false)
-		return r.recordLooperFailure(
-			reqCtx, originalModel, decision, 502,
-			"Looper streaming dispatch encoding failed", "looper_stream_dispatch_encode_failed",
+		statusCode := 502
+		lifecycleState := routerreplay.LifecycleFailed
+		reason := "looper_stream_dispatch_encode_failed"
+		msg := "Looper streaming dispatch encoding failed"
+
+		var budgetErr *selection.RequestBudgetError
+		if errors.As(err, &budgetErr) || (reqCtx != nil && reqCtx.ImmediateProtocolError != nil) {
+			statusCode = 400
+			reason = "looper_stream_dispatch_bad_request"
+			msg = "Looper streaming dispatch rejected: " + err.Error()
+		} else if errors.Is(err, context.Canceled) {
+			statusCode = 499
+			lifecycleState = routerreplay.LifecycleAborted
+			reason = "client_cancelled_during_looper_dispatch"
+			msg = "Client cancelled during looper dispatch"
+		}
+
+		return r.recordLooperFailureWithLifecycle(
+			reqCtx, originalModel, decision, statusCode,
+			msg, lifecycleState, reason,
 			looperFailureEvidence{
 				algorithm:    decision.Algorithm.Type,
 				modelsUsed:   plan.ModelsUsed,
@@ -391,6 +430,9 @@ func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
 	setProviderRequestPath(&state.setHeaders, nil, dispatch.targetFormat)
 	r.applyDecisionHeaderMutations(state, reqCtx)
 
+	if err := r.applyMaskingBeforeDispatch(reqCtx); err != nil {
+		return nil, 0, err
+	}
 	mutatedBody, err := r.encodeDispatchRequest(reqCtx)
 	if err != nil {
 		return nil, 0, err
