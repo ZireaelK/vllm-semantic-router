@@ -19,6 +19,7 @@ package extproc
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -663,4 +664,191 @@ func TestObserveProtocolStream_CJKAbortAccumulatesEstimatedTokens(t *testing.T) 
 
 func replayInt64Ptr(v int64) *int64 {
 	return &v
+}
+
+func TestBuildLooperStreamingDispatchResponse_PreservesClientSemanticRequestContext(t *testing.T) {
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			BackendModels: config.BackendModels{ModelConfig: map[string]config.ModelParams{
+				"judge": {Capabilities: []string{"chat"}},
+			}},
+		},
+	}
+	originalSemanticReq := &llmprotocol.Request{
+		Model: "original-user-model",
+		Messages: []llmprotocol.Message{
+			{Role: llmprotocol.RoleUser, Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: "client prompt"}}},
+		},
+	}
+	originalEnvelope := llmprotocol.Envelope{Request: []byte(`{"client":"raw"}`)}
+
+	reqCtx := &RequestContext{
+		RequestID:        "req-anti-pollution",
+		SourceFormat:     llmprotocol.OpenAIChatV1,
+		SemanticRequest:  originalSemanticReq,
+		ProtocolEnvelope: originalEnvelope,
+	}
+
+	decision := &config.Decision{
+		Name: "test-decision",
+	}
+
+	synthesisBody := []byte(`{"model":"judge","messages":[{"role":"system","content":"synthesis prompt"}]}`)
+	_, _, _ = router.buildLooperStreamingDispatchResponse(synthesisBody, "judge", decision, reqCtx)
+
+	require.Same(t, originalSemanticReq, reqCtx.SemanticRequest, "reqCtx.SemanticRequest must be restored to client's original request")
+	require.Equal(t, originalEnvelope, reqCtx.ProtocolEnvelope, "reqCtx.ProtocolEnvelope must be restored to client's original envelope")
+}
+
+func TestHandleLooperStreamingDispatch_ImmediateResponseRecordsIntermediateUsage(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{Enabled: true},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	reqCtx := &RequestContext{
+		RequestID:                "req-immediate-fail",
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &replayConfig,
+		ExpectStreamingResponse:  true,
+		SourceFormat:             llmprotocol.OpenAIChatV1,
+		RequestModel:             "entrypoint-model",
+	}
+
+	decision := &config.Decision{
+		Name: "fusion-stream",
+		Algorithm: &config.AlgorithmConfig{
+			Type: config.DecisionAlgorithmFusion,
+		},
+	}
+
+	immediateResp := router.createErrorResponse(503, "immediate dispatch rejected")
+
+	evidence := looperFailureEvidence{
+		algorithm:  decision.Algorithm.Type,
+		modelsUsed: []string{"panel-a", "panel-b"},
+		iterations: 2,
+		usage: looper.TokenUsage{
+			PromptTokens:     150,
+			CompletionTokens: 80,
+			TotalTokens:      230,
+		},
+	}
+
+	router.recordLooperImmediateDispatchFailure(reqCtx, "entrypoint-model", decision, immediateResp, evidence)
+
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+	require.Equal(t, "looper_stream_dispatch_rejected", record.TerminalReason)
+	require.NotNil(t, record.PromptTokens)
+	require.Equal(t, 150, *record.PromptTokens)
+	require.NotNil(t, record.CompletionTokens)
+	require.Equal(t, 80, *record.CompletionTokens)
+}
+
+func TestFinalizeSemanticStreamingResponse_AbnormalStreamSetsLifecycleFailed(t *testing.T) {
+	t.Run("responseErr sets LifecycleFailed and resists EOF", func(t *testing.T) {
+		memStore := store.NewMemoryStore(10, 0)
+		recorder := routerreplay.NewRecorder(memStore)
+		replayConfig := config.DefaultRouterReplayPluginConfig()
+
+		router := &OpenAIRouter{
+			Config: &config.RouterConfig{
+				RouterReplay: config.RouterReplayConfig{Enabled: true},
+			},
+			ReplayRecorder: recorder,
+		}
+
+		reqCtx := &RequestContext{
+			RequestID:                "req-abnormal-stream",
+			RouterReplayRecorder:     recorder,
+			RouterReplayPluginConfig: &replayConfig,
+			IsStreamingResponse:      true,
+			LooperStreamingActive:    true,
+			LooperIntermediateUsage: looper.TokenUsage{
+				PromptTokens:     30,
+				CompletionTokens: 15,
+				TotalTokens:      45,
+			},
+			SemanticStreamState: &semanticResponseStreamState{
+				terminal: false,
+			},
+		}
+		router.startRouterReplay(reqCtx, "router-entrypoint", "judge", "fusion-stream")
+
+		router.finalizeSemanticStreamingResponse(reqCtx, nil)
+
+		require.True(t, reqCtx.StreamingAborted)
+		record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+		require.Equal(t, "upstream_stream_incomplete", record.TerminalReason)
+
+		require.NoError(t, router.handleProcessReceiveError(reqCtx, io.EOF))
+		recordAfterEOF, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleFailed, recordAfterEOF.LifecycleState)
+		require.Equal(t, "upstream_stream_incomplete", recordAfterEOF.TerminalReason)
+	})
+
+	t.Run("usage invalid sets LifecycleFailed and resists client canceled", func(t *testing.T) {
+		memStore := store.NewMemoryStore(10, 0)
+		recorder := routerreplay.NewRecorder(memStore)
+		replayConfig := config.DefaultRouterReplayPluginConfig()
+
+		router := &OpenAIRouter{
+			Config: &config.RouterConfig{
+				RouterReplay: config.RouterReplayConfig{Enabled: true},
+			},
+			ReplayRecorder: recorder,
+		}
+
+		streamState := &semanticResponseStreamState{
+			responseID: "resp-1",
+			model:      "judge",
+			stop:       llmprotocol.StopEndTurn,
+			terminal:   true,
+			items: map[int]*semanticStreamItem{
+				0: {completed: true, text: "completed text"},
+			},
+			order: []int{0},
+			usage: llmprotocol.Usage{State: llmprotocol.UsageUnavailable},
+		}
+
+		reqCtx := &RequestContext{
+			RequestID:                "req-invalid-usage-stream",
+			RouterReplayRecorder:     recorder,
+			RouterReplayPluginConfig: &replayConfig,
+			IsStreamingResponse:      true,
+			LooperStreamingActive:    true,
+			LooperIntermediateUsage: looper.TokenUsage{
+				PromptTokens:     10,
+				CompletionTokens: 5,
+				TotalTokens:      15,
+			},
+			SemanticStreamState: streamState,
+		}
+		router.startRouterReplay(reqCtx, "router-entrypoint", "judge", "fusion-stream")
+
+		router.finalizeSemanticStreamingResponse(reqCtx, nil)
+
+		require.True(t, reqCtx.StreamingAborted)
+		record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+		require.Equal(t, "upstream_stream_incomplete", record.TerminalReason)
+
+		require.NoError(t, router.handleProcessReceiveError(reqCtx, context.Canceled))
+		recordAfterCancel, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleFailed, recordAfterCancel.LifecycleState)
+		require.Equal(t, "upstream_stream_incomplete", recordAfterCancel.TerminalReason)
+	})
 }

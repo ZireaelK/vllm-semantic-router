@@ -102,6 +102,13 @@ func (l *FusionLooper) PrepareStreamingSynthesis(
 
 	finalReq := appendFusionStageMessage(req.OriginalRequest, prompt)
 	finalReq.Model = cfg.Model
+	if cfg.Temperature != nil {
+		finalReq.Temperature = openai.Float(*cfg.Temperature)
+	}
+	if cfg.MaxCompletionTokens > 0 {
+		finalReq.MaxTokens = (openai.ChatCompletionNewParams{}).MaxTokens
+		finalReq.MaxCompletionTokens = openai.Int(int64(cfg.MaxCompletionTokens))
+	}
 
 	trace := buildFusionTrace(cfg, groundedPanel, panel.failedModels, analysis, groundingMode, groundingScores)
 	modelsUsed := orderedFusionModelsUsed(panel.dispatchedModels, cfg.Model)

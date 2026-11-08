@@ -257,6 +257,16 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 	}
 	if dispatchResponse.GetImmediateResponse() != nil {
 		finalizeLooperQuorumOutcome(reqCtx, plan.QuorumOutcome, decision, false)
+		r.recordLooperImmediateDispatchFailure(
+			reqCtx, originalModel, decision, dispatchResponse,
+			looperFailureEvidence{
+				algorithm:    decision.Algorithm.Type,
+				modelsUsed:   plan.ModelsUsed,
+				iterations:   plan.Iterations,
+				usage:        plan.IntermediateUsage,
+				fusionQuorum: plan.QuorumOutcome,
+			},
+		)
 		return dispatchResponse, nil
 	}
 
@@ -296,6 +306,15 @@ func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
 	decision *config.Decision,
 	reqCtx *RequestContext,
 ) (*ext_proc.ProcessingResponse, int, error) {
+	if reqCtx != nil {
+		clientSemanticReq := reqCtx.SemanticRequest
+		clientEnvelope := reqCtx.ProtocolEnvelope
+		defer func() {
+			reqCtx.SemanticRequest = clientSemanticReq
+			reqCtx.ProtocolEnvelope = clientEnvelope
+		}()
+	}
+
 	engine, err := r.protocolEngine()
 	if err != nil {
 		return nil, 0, err

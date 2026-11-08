@@ -26,6 +26,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/looper"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/sessiontelemetry"
 )
 
 type looperFailureEvidence struct {
@@ -174,6 +175,61 @@ func (r *OpenAIRouter) recordLooperFailure(
 	r.finalizeRouterReplay(ctx, routerreplay.LifecycleFailed, reason)
 	addRouterReplayHeaderToImmediateResponse(response, ctx.RouterReplayID)
 	return response
+}
+
+func (r *OpenAIRouter) recordLooperImmediateDispatchFailure(
+	ctx *RequestContext,
+	originalModel string,
+	decision *config.Decision,
+	response *ext_proc.ProcessingResponse,
+	evidence looperFailureEvidence,
+) {
+	if ctx == nil || response == nil {
+		return
+	}
+	decisionName := ""
+	if decision != nil {
+		decisionName = decision.Name
+	}
+	applyLooperFailureEvidence(ctx, evidence)
+
+	statusCode := 500
+	if immediate := response.GetImmediateResponse(); immediate != nil {
+		if immediate.GetStatus() != nil && immediate.GetStatus().GetCode() != 0 {
+			statusCode = int(immediate.GetStatus().GetCode())
+		}
+	}
+
+	r.startRouterReplay(ctx, originalModel, "", decisionName)
+	r.updateLooperReplayUsage(ctx, evidence.usage)
+	r.updateRouterReplayStatus(ctx, statusCode, false)
+	if immediate := response.GetImmediateResponse(); immediate != nil {
+		r.attachRouterReplayResponse(ctx, immediate.Body, false)
+	}
+	r.finalizeRouterReplay(ctx, routerreplay.LifecycleFailed, "looper_stream_dispatch_rejected")
+	addRouterReplayHeaderToImmediateResponse(response, ctx.RouterReplayID)
+
+	if evidence.usage.PromptTokens > 0 || evidence.usage.CompletionTokens > 0 {
+		recordSessionTurn(ctx, responseUsageMetrics{
+			promptTokens:     int(evidence.usage.PromptTokens),
+			completionTokens: int(evidence.usage.CompletionTokens),
+		}, sessiontelemetry.TurnPricing{})
+		logging.LogEvent("llm_usage", map[string]interface{}{
+			"request_id":                     ctx.RequestID,
+			"model":                          originalModel,
+			"decision":                       decisionName,
+			"prompt_tokens":                  evidence.usage.PromptTokens,
+			"completion_tokens":              evidence.usage.CompletionTokens,
+			"total_tokens":                   evidence.usage.TotalTokens,
+			"cost":                           0.0,
+			"currency":                       "unknown",
+			"pricing":                        "looper_immediate_rejected_unpriced",
+			"intermediate_prompt_tokens":     evidence.usage.PromptTokens,
+			"intermediate_completion_tokens": evidence.usage.CompletionTokens,
+			"looper_models_used":             evidence.modelsUsed,
+			"looper_iterations":              evidence.iterations,
+		})
+	}
 }
 
 func applyLooperFailureEvidence(ctx *RequestContext, evidence looperFailureEvidence) {

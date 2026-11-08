@@ -194,3 +194,33 @@ func TestPrepareStreamingSynthesis_QuorumFailureAborts(t *testing.T) {
 	assert.Nil(t, plan)
 	assert.True(t, strings.Contains(err.Error(), "quorum") || strings.Contains(err.Error(), "panel"))
 }
+
+func TestPrepareStreamingSynthesis_PreservesSamplingParams(t *testing.T) {
+	server := newFusionStubServer(t, func(model, prompt string) (string, int) {
+		return "panel ok", http.StatusOK
+	})
+	defer server.Close()
+
+	temp := 0.7
+	req := newFusionTestRequest()
+	req.IsStreaming = true
+	req.Algorithm = &config.AlgorithmConfig{
+		Type: "fusion",
+		Fusion: &config.FusionAlgorithmConfig{
+			Model:               "judge",
+			AnalysisModels:      []string{"panel-a"},
+			AnalysisMode:        config.FusionAnalysisModeOneCall,
+			Temperature:         &temp,
+			MaxCompletionTokens: 1024,
+		},
+	}
+
+	looper := NewFusionLooper(&config.LooperConfig{Endpoint: server.URL})
+	plan, err := looper.PrepareStreamingSynthesis(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	assert.Equal(t, temp, plan.SynthesisParams.Temperature.Value)
+	assert.Equal(t, int64(1024), plan.SynthesisParams.MaxCompletionTokens.Value)
+}
+

@@ -17,6 +17,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/protocolcodec"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/ratelimit"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
 )
 
 // semanticResponseStreamState is request-scoped reconstruction state for
@@ -468,6 +469,11 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 		streamingCalibrationByteLen(ctx),
 		calibrationPromptTokens,
 	)
+
+	if responseErr != nil || usage.invalid {
+		ctx.StreamingAborted = true
+		r.finalizeRouterReplay(ctx, routerreplay.LifecycleFailed, "upstream_stream_incomplete")
+	}
 
 	if responseErr != nil {
 		logging.ComponentWarnEvent("extproc", "neutral_stream_reconstruction_skipped", map[string]interface{}{
