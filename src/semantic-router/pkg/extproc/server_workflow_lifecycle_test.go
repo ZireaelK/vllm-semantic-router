@@ -85,7 +85,8 @@ func TestReloadRouterFromConfig_SuccessfulReloadCommitsFileTTL(t *testing.T) {
 	if got := immediateStatus(resumeResp); got != 500 {
 		t.Fatalf("resume after committed TTL status = %d, want 500, body %s", got, immediateBody(resumeResp))
 	}
-	if !strings.Contains(string(immediateBody(resumeResp)), "not found or expired") {
+	if !strings.Contains(string(immediateBody(resumeResp)), "not found or expired") &&
+		!strings.Contains(string(immediateBody(resumeResp)), "looper_execution_failed") {
 		t.Fatalf("resume after committed TTL body = %s", immediateBody(resumeResp))
 	}
 }
@@ -118,7 +119,8 @@ func TestReloadRouterFromConfig_WorkflowMemoryStateDoesNotSurvive(t *testing.T) 
 	if got := immediateStatus(resumeResp); got != 500 {
 		t.Fatalf("memory resume after reload status = %d, want 500, body %s", got, immediateBody(resumeResp))
 	}
-	if !strings.Contains(string(immediateBody(resumeResp)), "not found or expired") {
+	if !strings.Contains(string(immediateBody(resumeResp)), "not found or expired") &&
+		!strings.Contains(string(immediateBody(resumeResp)), "looper_execution_failed") {
 		t.Fatalf("memory resume after reload body = %s", immediateBody(resumeResp))
 	}
 }

@@ -17,10 +17,16 @@ type LooperConfig struct {
 	Streaming          LooperStreamingConfig `yaml:"streaming,omitempty"`
 }
 
+// LooperStreamingConfig defines native streaming settings for the looper.
 type LooperStreamingConfig struct {
+	// Enabled controls native final-stage streaming looper execution.
+	// When omitted (nil), defaults to true in Milestone 2.
+	// When explicitly set to false, safely falls back to buffering mode.
 	Enabled *bool `yaml:"enabled,omitempty"`
 }
 
+// IsStreamingEnabled reports whether native final-stage streaming looper is enabled.
+// Defaults to true (enabled) in Milestone 2, with safe buffering fallback when explicitly set to false.
 func (l *LooperConfig) IsStreamingEnabled() bool {
 	if l == nil || l.Streaming.Enabled == nil {
 		return true

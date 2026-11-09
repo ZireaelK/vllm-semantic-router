@@ -10,6 +10,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/ratelimit"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/sessiontelemetry"
 )
 
 type responseUsageMetrics struct {
@@ -76,7 +77,11 @@ func (r *OpenAIRouter) reportNonStreamingUsage(
 	completionLatency time.Duration,
 	usage responseUsageMetrics,
 ) {
-	recordSessionTurnOutcome(ctx, usage, r.sessionTurnPricing(ctx.RequestModel))
+	pricing := r.sessionTurnPricing(ctx.RequestModel)
+	if ctx != nil && ctx.LooperStreamingActive {
+		pricing = sessiontelemetry.TurnPricing{}
+	}
+	recordSessionTurnOutcome(ctx, usage, pricing)
 	if usage.invalid {
 		usage = responseUsageMetrics{}
 	}
@@ -91,17 +96,19 @@ func (r *OpenAIRouter) reportNonStreamingUsage(
 	}
 
 	if totalTokens > 0 {
-		recordSessionTurn(ctx, usage, r.sessionTurnPricing(ctx.RequestModel))
+		recordSessionTurn(ctx, usage, pricing)
 	}
 
-	if ctx.RequestModel == "" {
+	if ctx.InflightToken != 0 {
+		inflight.End(ctx.InflightModel, ctx.InflightToken)
+		ctx.InflightToken = 0
+	}
+	if ctx.RequestModel == "" || (ctx != nil && ctx.LooperStreamingActive) {
 		return
 	}
 
 	recordModelUsageTokens(ctx.RequestModel, usage)
 	metrics.RecordModelCompletionLatency(ctx.RequestModel, completionLatency.Seconds())
-	inflight.End(ctx.InflightModel, ctx.InflightToken)
-	ctx.InflightToken = 0
 
 	if usage.completionTokens > 0 {
 		timePerToken := completionLatency.Seconds() / float64(usage.completionTokens)
@@ -162,9 +169,13 @@ func (r *OpenAIRouter) calibrateTokenEstimatorForModel(
 		classifier.ObserveTokenUsage(category, byteLen, actualPromptTokens)
 	}
 	if compressionCategory := contextCompressionTokenCalibrationCategoryForModel(ctx, model); compressionCategory != "" {
+		compressionByteLen := len(cacheRequestBodyForContext(ctx))
+		if ctx.LooperStreamingActive {
+			compressionByteLen = byteLen
+		}
 		classifier.ObserveTokenUsage(
 			compressionCategory,
-			len(cacheRequestBodyForContext(ctx)),
+			compressionByteLen,
 			actualPromptTokens,
 		)
 	}

@@ -46,6 +46,12 @@ func (r *OpenAIRouter) handleNonStreamingResponseBody(
 	// the translated response instead.
 	rewriteClientBody := requiresClientResponseRewrite(ctx) ||
 		ctx.SourceFormat == llmprotocol.OpenAIChatV1 && ctx.ResponseBodyNeedsRewrite
+	if ctx != nil && ctx.LooperStreamingActive && ctx.RequestModel != "" && semanticResponse.Model != ctx.RequestModel {
+		semanticResponse.Model = ctx.RequestModel
+		rewriteClientBody = true
+		ctx.ResponseEnvelope.ResponseReencodeRequired = true
+		ctx.ResponseBodyNeedsRewrite = true
+	}
 	if rewriteClientBody {
 		clientBody, err = r.encodeClientResponse(*semanticResponse, ctx)
 		if err != nil {
@@ -56,12 +62,43 @@ func (r *OpenAIRouter) handleNonStreamingResponseBody(
 		)
 	}
 	usage := r.takeNeutralResponseUsage(ctx)
-	observeUpstreamResponse(ctx, semanticResponse.Model, usage)
+	if ctx != nil && ctx.LooperStreamingActive {
+		observeUpstreamResponse(ctx, "", usage)
+		synthesisPromptTokens := 0
+		if ctx.SemanticResponse != nil {
+			synthesisUsage := responseUsageFromSemanticUsage(ctx.SemanticResponse.Usage)
+			if !synthesisUsage.invalid {
+				synthesisPromptTokens = synthesisUsage.promptTokens
+			}
+		}
+		if synthesisPromptTokens > 0 {
+			r.calibrateTokenEstimatorForModel(ctx, ctx.LooperTargetModel, streamingCalibrationByteLen(ctx), synthesisPromptTokens)
+		}
+	} else {
+		observeUpstreamResponse(ctx, semanticResponse.Model, usage)
+		r.calibrateTokenEstimator(ctx, usage.promptTokens)
+	}
 	r.reportNonStreamingUsage(ctx, completionLatency, usage)
-	r.calibrateTokenEstimator(ctx, usage.promptTokens)
+	if ctx != nil && ctx.LooperStreamingActive {
+		if usage.invalid {
+			reason := usage.invalidReason
+			if reason == "" {
+				reason = "authoritative_usage_missing"
+			}
+			r.settleAbortedLooperStreamingUsage(ctx, errors.New(reason))
+		} else {
+			ctx.LooperUsageSettled = true
+			replayUsage := r.recordResponseCost(ctx, completionLatency, usage)
+			if ctx.RouterReplayID != "" {
+				r.updateRouterReplayUsageCost(ctx, replayUsage)
+			}
+		}
+	}
 
 	r.updateKVAddressRegistry(ctx)
-	r.updateResponseCache(ctx, r.cacheableClientResponse(clientBody, rewriteClientBody, *semanticResponse, ctx))
+	if ctx == nil || !ctx.LooperStreamingActive {
+		r.updateResponseCache(ctx, r.cacheableClientResponse(clientBody, rewriteClientBody, *semanticResponse, ctx))
+	}
 
 	blocked, finalBody, headerOptions := r.finalizeResponsePolicy(ctx, semanticResponse, clientBody)
 	lateWarning, hasLateDiagnostics := recordBufferedProtocolDiagnostics(ctx, diagnosticsBeforeBody)
@@ -210,6 +247,9 @@ func (r *OpenAIRouter) prepareResponsePolicy(
 			addResponseCostHeaders(ctx, response)
 			r.persistResponseObject(ctx)
 			r.updateRouterReplayHallucinationStatus(ctx)
+			if ctx != nil && ctx.LooperStreamingActive {
+				finalBody = attachLooperTraceToReplaySnapshot(ctx, finalBody)
+			}
 			r.attachRouterReplayResponse(ctx, finalBody, true)
 		},
 	}

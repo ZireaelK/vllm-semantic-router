@@ -990,3 +990,47 @@ func fusionTestUsage(model string) map[string]int64 {
 func float64Ptr(v float64) *float64 {
 	return &v
 }
+
+func TestProjectFusionPublicTrace(t *testing.T) {
+	assert.Nil(t, ProjectFusionPublicTrace(nil))
+
+	trace := &FusionTrace{
+		AnalysisMode: config.FusionAnalysisModeOneCall,
+		Analysis: &FusionAnalysis{
+			Consensus: []string{"consensus item"},
+		},
+		Responses: []FusionPanelResponse{
+			{Model: "panel-a", Content: "content a"},
+		},
+		FailedModels: []FusionFailedModel{
+			{Model: "panel-b", Error: "500 error"},
+		},
+		JudgeModel:     "judge",
+		AnalysisModels: []string{"panel-a", "panel-b"},
+		PromptVersion:  "v1",
+		Grounding: &FusionGroundingTrace{
+			Policy: "strict",
+		},
+	}
+
+	projected := ProjectFusionPublicTrace(trace)
+	require.NotNil(t, projected)
+	assert.Equal(t, trace.Analysis, projected.Analysis)
+	assert.Equal(t, trace.Responses, projected.Responses)
+	assert.Equal(t, trace.FailedModels, projected.FailedModels)
+	assert.Equal(t, trace.JudgeModel, projected.JudgeModel)
+	assert.Equal(t, trace.AnalysisModels, projected.AnalysisModels)
+	assert.Equal(t, trace.PromptVersion, projected.PromptVersion)
+	assert.Equal(t, trace.Grounding, projected.Grounding)
+
+	// Ensure analysis_mode is stripped when serialized to JSON
+	encoded, err := json.Marshal(projected)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), `"analysis_mode"`)
+	assert.Contains(t, string(encoded), "consensus item")
+
+	var m map[string]interface{}
+	require.NoError(t, json.Unmarshal(encoded, &m))
+	assert.NotContains(t, m, "analysis_mode")
+	assert.Contains(t, m, "analysis_models")
+}

@@ -161,6 +161,10 @@ func (r *OpenAIRouter) handleProcessReceiveError(ctx *RequestContext, err error)
 	}
 
 	state, reason := replayLifecycleForReceiveError(err)
+	if ctx != nil && ctx.UpstreamStatusCode >= 400 {
+		state = routerreplay.LifecycleFailed
+		reason = "upstream_error_response"
+	}
 	r.finalizeRouterReplay(ctx, state, reason)
 
 	if errors.Is(err, io.EOF) {

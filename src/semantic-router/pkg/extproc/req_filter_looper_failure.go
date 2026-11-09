@@ -17,12 +17,14 @@ limitations under the License.
 package extproc
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/looper"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
@@ -64,6 +66,12 @@ func (r *OpenAIRouter) looperExecutionErrorResponse(
 	finalizeLooperQuorumOutcome(reqCtx, evidence.fusionQuorum, decision, false)
 
 	logging.ComponentErrorEvent("extproc", "looper_execution_failed", failureFields)
+	if reqCtx != nil && reqCtx.ImmediateProtocolError == nil {
+		reqCtx.ImmediateProtocolError = llmprotocol.NewError(
+			llmprotocol.ErrorInternal, "looper_execution_failed",
+			"Looper execution failed", err,
+		)
+	}
 	return r.recordLooperFailure(
 		reqCtx,
 		originalModel,
@@ -99,6 +107,15 @@ func looperFailureEvidenceFromError(err error) (looperFailureEvidence, bool) {
 			iterations:   len(modelsUsed),
 			usage:        evidence.Usage,
 			fusionQuorum: outcome,
+		}, true
+	}
+	var stageErr *looper.FusionStageFailureError
+	if errors.As(err, &stageErr) && stageErr != nil {
+		return looperFailureEvidence{
+			algorithm:  config.DecisionAlgorithmFusion,
+			modelsUsed: append([]string(nil), stageErr.ModelsUsed...),
+			iterations: stageErr.Iterations,
+			usage:      stageErr.Usage,
 		}, true
 	}
 	return looperFailureEvidence{}, false
@@ -198,6 +215,10 @@ func (r *OpenAIRouter) recordLooperFailureWithLifecycle(
 	if len(executionEvidence) > 0 {
 		r.updateLooperReplayUsage(ctx, executionEvidence[0].usage)
 	}
+	response = r.encodeImmediateResponseForClient(response, ctx)
+	if code := int(response.GetImmediateResponse().GetStatus().GetCode()); code != 0 {
+		statusCode = code
+	}
 	r.updateRouterReplayStatus(ctx, statusCode, false)
 	if immediate := response.GetImmediateResponse(); immediate != nil {
 		r.attachRouterReplayResponse(ctx, immediate.Body, false)
@@ -248,15 +269,13 @@ func (r *OpenAIRouter) recordLooperImmediateDispatchFailure(
 	}
 	applyLooperFailureEvidence(ctx, evidence)
 
-	statusCode := 500
-	if immediate := response.GetImmediateResponse(); immediate != nil {
-		if immediate.GetStatus() != nil && immediate.GetStatus().GetCode() != 0 {
-			statusCode = int(immediate.GetStatus().GetCode())
-		}
-	}
-
 	r.startRouterReplay(ctx, originalModel, "", decisionName)
 	r.updateLooperReplayUsage(ctx, evidence.usage)
+	response = r.encodeImmediateResponseForClient(response, ctx)
+	statusCode := int(response.GetImmediateResponse().GetStatus().GetCode())
+	if statusCode == 0 {
+		statusCode = 500
+	}
 	r.updateRouterReplayStatus(ctx, statusCode, false)
 	if immediate := response.GetImmediateResponse(); immediate != nil {
 		r.attachRouterReplayResponse(ctx, immediate.Body, false)

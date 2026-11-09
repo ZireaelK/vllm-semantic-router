@@ -3,6 +3,7 @@ package extproc
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
@@ -400,10 +401,19 @@ func (r *OpenAIRouter) encodeImmediateResponseForClient(
 		return response
 	}
 	status := int(immediate.GetStatus().GetCode())
-	if status >= 400 {
+	if status >= 400 || ctx.ImmediateProtocolError != nil {
 		protocolError := immediateProtocolError(status)
 		if ctx.ImmediateProtocolError != nil {
 			protocolError = ctx.ImmediateProtocolError
+			if status != http.StatusServiceUnavailable &&
+				status != http.StatusRequestEntityTooLarge &&
+				status != http.StatusRequestTimeout &&
+				status != http.StatusUnprocessableEntity {
+				if immediate.Status == nil {
+					immediate.Status = &typev3.HttpStatus{}
+				}
+				immediate.Status.Code = statusCodeToImmediateResponseCode(protocolErrorToHTTPStatus(ctx.ImmediateProtocolError))
+			}
 		}
 		if body, encodeErr := engine.EncodeError(format, protocolError); encodeErr == nil {
 			immediate.Body = body

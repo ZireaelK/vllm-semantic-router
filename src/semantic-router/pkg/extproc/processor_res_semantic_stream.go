@@ -14,6 +14,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/inflight"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/latency"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/looper"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/protocolcodec"
@@ -232,16 +233,16 @@ func recordStreamingTTFT(ctx *RequestContext) {
 		return
 	}
 
-	metrics.RecordModelFirstResponseObservation(ctx.RequestModel, ttft)
 	ctx.TTFTSeconds = ttft
 	ctx.TTFTRecorded = true
 	if !ctx.LooperStreamingActive {
+		metrics.RecordModelFirstResponseObservation(ctx.RequestModel, ttft)
 		latency.UpdateTTFT(ctx.RequestModel, ttft)
+		ctx.CacheWarmthEstimate = latency.EstimateCacheProbability(latency.CacheEstimationInput{
+			Model:       ctx.RequestModel,
+			TTFTSeconds: ttft,
+		})
 	}
-	ctx.CacheWarmthEstimate = latency.EstimateCacheProbability(latency.CacheEstimationInput{
-		Model:       ctx.RequestModel,
-		TTFTSeconds: ttft,
-	})
 	maybeEmitTransitionEvent(ctx)
 	logging.Debugf("Recorded TTFT on first streamed body chunk: model=%q, TTFT=%.4fs", ctx.RequestModel, ttft)
 }
@@ -446,7 +447,7 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 	completionLatency := time.Duration(0)
 	if !ctx.StartTime.IsZero() {
 		completionLatency = time.Since(ctx.StartTime)
-		if ctx.RequestModel != "" {
+		if ctx.RequestModel != "" && !ctx.LooperStreamingActive {
 			metrics.RecordModelCompletionLatency(ctx.RequestModel, completionLatency.Seconds())
 		}
 	}
@@ -549,7 +550,11 @@ func attachLooperTraceToReplaySnapshot(ctx *RequestContext, encoded []byte) []by
 	if ctx == nil || !ctx.LooperStreamingActive || ctx.LooperTrace == nil || len(encoded) == 0 {
 		return encoded
 	}
-	traceJSON, err := json.Marshal(ctx.LooperTrace)
+	tracePayload := ctx.LooperTrace
+	if fusionTrace, ok := ctx.LooperTrace.(*looper.FusionTrace); ok && fusionTrace != nil {
+		tracePayload = looper.ProjectFusionPublicTrace(fusionTrace)
+	}
+	traceJSON, err := json.Marshal(tracePayload)
 	if err != nil || len(traceJSON) == 0 || string(traceJSON) == "null" {
 		return encoded
 	}
@@ -595,21 +600,23 @@ func (r *OpenAIRouter) reportSemanticStreamingUsage(
 	}
 	if !ctx.LooperStreamingActive {
 		recordModelUsageTokens(ctx.RequestModel, usage)
+		metrics.RecordModelWindowedRequest(
+			ctx.RequestModel,
+			completionLatency.Seconds(),
+			int64(usage.promptTokens),
+			int64(usage.completionTokens),
+		)
 	}
-	metrics.RecordModelWindowedRequest(
-		ctx.RequestModel,
-		completionLatency.Seconds(),
-		int64(usage.promptTokens),
-		int64(usage.completionTokens),
-	)
 	if usage.completionTokens > 0 && completionLatency > 0 {
 		timePerToken := completionLatency.Seconds() / float64(usage.completionTokens)
-		metrics.RecordModelResponseDurationPerOutputToken(ctx.RequestModel, timePerToken)
 		if !ctx.LooperStreamingActive {
+			metrics.RecordModelResponseDurationPerOutputToken(ctx.RequestModel, timePerToken)
 			latency.UpdateTPOT(ctx.RequestModel, timePerToken)
 		}
 	}
 	replayUsage := r.recordResponseCost(ctx, completionLatency, usage)
 	r.updateRouterReplayUsageCost(ctx, replayUsage)
-	r.observeRouterLearningUsageTelemetry(ctx, completionLatency, usage, replayUsage)
+	if !ctx.LooperStreamingActive {
+		r.observeRouterLearningUsageTelemetry(ctx, completionLatency, usage, replayUsage)
+	}
 }

@@ -4,6 +4,8 @@ import (
 	"net/http"
 
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
 )
 
 func statusCodeToImmediateResponseCode(statusCode int) typev3.StatusCode {
@@ -24,4 +26,32 @@ func errorResponseStatusCode(statusCode int) int {
 		return http.StatusInternalServerError
 	}
 	return code
+}
+
+func protocolErrorToHTTPStatus(protocolError *llmprotocol.ProtocolError) int {
+	if protocolError == nil {
+		return http.StatusBadRequest
+	}
+	switch protocolError.Category {
+	case llmprotocol.ErrorNotFound:
+		return http.StatusNotFound
+	case llmprotocol.ErrorAuthentication:
+		return http.StatusUnauthorized
+	case llmprotocol.ErrorPermission:
+		return http.StatusForbidden
+	case llmprotocol.ErrorConflict:
+		return http.StatusConflict
+	case llmprotocol.ErrorRateLimited:
+		return http.StatusTooManyRequests
+	case llmprotocol.ErrorUpstreamTimeout:
+		return http.StatusGatewayTimeout
+	case llmprotocol.ErrorUpstreamUnavailable:
+		return http.StatusBadGateway
+	case llmprotocol.ErrorInternal:
+		return http.StatusInternalServerError
+	case llmprotocol.ErrorInvalidRequest, llmprotocol.ErrorUnsupportedFeature:
+		return http.StatusBadRequest
+	default:
+		return http.StatusBadRequest
+	}
 }

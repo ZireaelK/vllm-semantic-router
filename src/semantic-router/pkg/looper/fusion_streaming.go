@@ -9,6 +9,7 @@ import (
 	"github.com/openai/openai-go"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 )
 
@@ -60,6 +61,9 @@ func (l *FusionLooper) PrepareStreamingSynthesis(
 
 	groundedPanel, groundingScores, groundingMode, err := l.applyGrounding(ctx, req, cfg, panel.responses)
 	if err != nil {
+		if !panel.usage.IsZero() {
+			return nil, newFusionPanelStageError(err, panel, panel.usage, len(panel.dispatchedModels))
+		}
 		return nil, err
 	}
 
@@ -73,11 +77,20 @@ func (l *FusionLooper) PrepareStreamingSynthesis(
 
 	switch cfg.AnalysisMode {
 	case config.FusionAnalysisModeSeparate:
-		var analysisResp *ModelResponse
-		analysis, analysisResp = l.runFusionAnalysis(
+		var (
+			analysisResp *ModelResponse
+			analysisErr  error
+		)
+		analysis, analysisResp, analysisErr = l.runFusionAnalysis(
 			ctx, req, cfg, groundedPanel, groundingScores, panelAttempts+1)
 		if analysisResp != nil {
 			intermediateUsage = intermediateUsage.Add(analysisResp)
+		}
+		if analysisErr != nil {
+			if !intermediateUsage.IsZero() {
+				return nil, newFusionPanelStageError(analysisErr, panel, intermediateUsage, panelAttempts+1, cfg.Model)
+			}
+			return nil, analysisErr
 		}
 		iterations++
 
@@ -97,7 +110,11 @@ func (l *FusionLooper) PrepareStreamingSynthesis(
 		}
 
 	default:
-		return nil, fmt.Errorf("unsupported fusion analysis_mode %q", cfg.AnalysisMode)
+		unsupportedErr := fmt.Errorf("unsupported fusion analysis_mode %q", cfg.AnalysisMode)
+		if !intermediateUsage.IsZero() {
+			return nil, newFusionPanelStageError(unsupportedErr, panel, intermediateUsage, panelAttempts)
+		}
+		return nil, unsupportedErr
 	}
 
 	finalReq := appendFusionStageMessage(req.OriginalRequest, prompt)
@@ -108,6 +125,27 @@ func (l *FusionLooper) PrepareStreamingSynthesis(
 	if cfg.MaxCompletionTokens > 0 {
 		finalReq.MaxTokens = (openai.ChatCompletionNewParams{}).MaxTokens
 		finalReq.MaxCompletionTokens = openai.Int(int64(cfg.MaxCompletionTokens))
+	}
+	var stageAdditionalModels []string
+	if cfg.AnalysisMode == config.FusionAnalysisModeSeparate {
+		stageAdditionalModels = []string{cfg.Model}
+	}
+	if err := capLooperStageOutput(req, finalReq); err != nil {
+		if !intermediateUsage.IsZero() {
+			return nil, newFusionPanelStageError(err, panel, intermediateUsage, iterations, stageAdditionalModels...)
+		}
+		return nil, err
+	}
+	if req != nil && req.ToolStageGate != nil && (len(finalReq.Tools) > 0 || len(finalReq.Functions) > 0) {
+		if gated := req.ToolStageGate(llmprotocol.TrustedStageFinal, finalReq); gated != nil {
+			finalReq = gated
+		}
+	}
+	if err := validateLooperStageContext(req, finalReq, cfg.Model); err != nil {
+		if !intermediateUsage.IsZero() {
+			return nil, newFusionPanelStageError(err, panel, intermediateUsage, iterations, stageAdditionalModels...)
+		}
+		return nil, err
 	}
 
 	trace := buildFusionTrace(cfg, groundedPanel, panel.failedModels, analysis, groundingMode, groundingScores)
@@ -180,6 +218,22 @@ func (l *FusionLooper) applyStreamingQuorumFailurePolicy(
 			fallbackReq.MaxCompletionTokens = openai.Int(int64(cfg.MaxCompletionTokens))
 		}
 	}
+	if err := capLooperStageOutput(req, fallbackReq); err != nil {
+		l.logQuorumDecision(req, cfg, evidence, FusionQuorumFailed, "")
+		return nil, fmt.Errorf("cap fallback stage output: %w",
+			quorumErr.WithPolicyOutcome(policy, "", FusionQuorumFailed, evidence.Usage))
+	}
+	if req != nil && req.ToolStageGate != nil && fallbackReq != nil && (len(fallbackReq.Tools) > 0 || len(fallbackReq.Functions) > 0) {
+		if gated := req.ToolStageGate(llmprotocol.TrustedStageFinal, fallbackReq); gated != nil {
+			fallbackReq = gated
+		}
+	}
+	if err := validateLooperStageContext(req, fallbackReq, target); err != nil {
+		disposition := fusionQuorumFallbackDisposition(ctx, err)
+		l.logQuorumDecision(req, cfg, evidence, disposition, target)
+		return nil, fmt.Errorf("validate fallback stage context: %w",
+			quorumErr.WithPolicyOutcome(policy, target, disposition, evidence.Usage))
+	}
 
 	modelsUsed := append(append([]string{}, panel.dispatchedModels...), target)
 	iterations := len(panel.dispatchedModels) + 1
@@ -197,4 +251,10 @@ func (l *FusionLooper) applyStreamingQuorumFailurePolicy(
 		Iterations:        iterations,
 		QuorumOutcome:     quorumOutcome,
 	}, nil
+}
+
+func newFusionPanelStageError(cause error, panel fusionPanelOutcome, usage TokenUsage, iterations int, additionalModels ...string) error {
+	modelsUsed := append([]string(nil), panel.dispatchedModels...)
+	modelsUsed = append(modelsUsed, additionalModels...)
+	return NewFusionStageFailureError(cause, modelsUsed, iterations, usage)
 }

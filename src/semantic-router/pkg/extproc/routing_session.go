@@ -3,6 +3,7 @@ package extproc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"runtime/debug"
 	"strconv"
@@ -181,6 +182,9 @@ func (s *routingSession) phase(
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			if s.ctx != nil && s.router != nil {
+				s.router.settleAbortedLooperStreamingUsage(s.ctx, fmt.Errorf("processor_panic: %v", recovered))
+			}
 			s.router.finalizeRouterReplay(s.ctx, routerreplay.LifecycleFailed, "processor_panic")
 			logging.Errorf("routing session: recovered panic: %v\n%s", recovered, debug.Stack())
 			effect, err = nil, status.Errorf(codes.Internal, "internal error: %v", recovered)
@@ -193,6 +197,9 @@ func (s *routingSession) phase(
 		effect, err = routingEffect(response)
 	}
 	if err != nil {
+		if s.ctx != nil && s.router != nil {
+			s.router.settleAbortedLooperStreamingUsage(s.ctx, err)
+		}
 		state, reason := replayLifecycleForProcessError(err)
 		s.router.finalizeRouterReplay(s.ctx, state, reason)
 		s.end(err)

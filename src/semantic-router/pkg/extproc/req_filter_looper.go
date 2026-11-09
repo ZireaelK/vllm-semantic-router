@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
@@ -224,12 +225,18 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 		reason := "looper_streaming_prepare_failed"
 
 		if errors.Is(err, context.Canceled) || (quorumOutcome != nil && quorumOutcome.Disposition == looper.FusionQuorumCancelled) {
-			statusCode = 499
+			statusCode = 500
 			lifecycleState = routerreplay.LifecycleAborted
 			reason = "client_cancelled_during_looper_prepare"
+			if reqCtx != nil {
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInternal, "request_canceled", "request canceled", err)
+			}
 		} else if errors.Is(err, context.DeadlineExceeded) {
 			statusCode = 504
 			reason = "looper_streaming_deadline_exceeded"
+			if reqCtx != nil {
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorUpstreamTimeout, "request_timeout", "request timed out", err)
+			}
 		}
 
 		return r.recordLooperFailureWithLifecycle(
@@ -260,6 +267,14 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 		targetModel = strings.TrimSpace(plan.SynthesisParams.Model)
 	}
 
+	reqCtx.LooperStreamingActive = true
+	success := false
+	defer func() {
+		if !success {
+			reqCtx.LooperStreamingActive = false
+		}
+	}()
+
 	dispatchResponse, synthesisTextBytes, err := r.buildLooperStreamingDispatchResponse(
 		rawSynthesisBody, targetModel, decision, reqCtx,
 	)
@@ -270,16 +285,31 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 		reason := "looper_stream_dispatch_encode_failed"
 		msg := "Looper streaming dispatch encoding failed"
 
+		var maskingErr *maskingDispatchError
 		var budgetErr *selection.RequestBudgetError
-		if errors.As(err, &budgetErr) || (reqCtx != nil && reqCtx.ImmediateProtocolError != nil) {
-			statusCode = 400
-			reason = "looper_stream_dispatch_bad_request"
-			msg = "Looper streaming dispatch rejected: " + err.Error()
+		if errors.As(err, &maskingErr) {
+			statusCode = http.StatusServiceUnavailable // 503
+			reason = "looper_stream_dispatch_masking_unavailable"
+			msg = maskingUnavailableMessage
 		} else if errors.Is(err, context.Canceled) {
-			statusCode = 499
+			statusCode = 500
 			lifecycleState = routerreplay.LifecycleAborted
 			reason = "client_cancelled_during_looper_dispatch"
 			msg = "Client cancelled during looper dispatch"
+			if reqCtx != nil {
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInternal, "request_canceled", "request canceled", err)
+			}
+		} else if errors.As(err, &budgetErr) {
+			statusCode = 400
+			reason = "looper_stream_dispatch_bad_request"
+			msg = "Looper streaming dispatch rejected: " + err.Error()
+			if reqCtx != nil {
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInvalidRequest, budgetErr.Code, budgetErr.Message, err)
+			}
+		} else if reqCtx != nil && reqCtx.ImmediateProtocolError != nil {
+			statusCode = protocolErrorToHTTPStatus(reqCtx.ImmediateProtocolError)
+			reason = "looper_stream_dispatch_protocol_error"
+			msg = reqCtx.ImmediateProtocolError.Message
 		}
 
 		return r.recordLooperFailureWithLifecycle(
@@ -309,8 +339,8 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 		return dispatchResponse, nil
 	}
 
+	success = true
 	// Update RequestContext state for subsequent response stream handling and audit
-	reqCtx.LooperStreamingActive = true
 	reqCtx.LooperTargetModel = targetModel
 	reqCtx.LooperSynthesisTextBytes = synthesisTextBytes
 	reqCtx.LooperIntermediateUsage = plan.IntermediateUsage
@@ -345,6 +375,10 @@ func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
 	decision *config.Decision,
 	reqCtx *RequestContext,
 ) (*ext_proc.ProcessingResponse, int, error) {
+	if reqCtx != nil && reqCtx.TraceContext != nil && reqCtx.TraceContext.Err() != nil {
+		return nil, 0, reqCtx.TraceContext.Err()
+	}
+
 	if reqCtx != nil {
 		clientSemanticReq := reqCtx.SemanticRequest
 		clientEnvelope := reqCtx.ProtocolEnvelope
@@ -412,10 +446,17 @@ func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
 	synthesisReq.Model = dispatch.upstreamModel
 	synthesisReq.Stream = true
 	synthesisReq.Generation++
-	reqCtx.TargetFormat = dispatch.targetFormat
-	reqCtx.SemanticRequest = &synthesisReq
-	reqCtx.RequestModel = dispatch.logicalModel
-	reqCtx.VSRSelectedModel = dispatch.logicalModel
+	if reqCtx != nil {
+		reqCtx.TargetFormat = dispatch.targetFormat
+		reqCtx.SemanticRequest = &synthesisReq
+		reqCtx.RequestModel = dispatch.logicalModel
+		reqCtx.VSRSelectedModel = dispatch.logicalModel
+		if reqCtx.SemanticRequest != nil {
+			if _, paramsErr := r.applyDispatchRequestParams(reqCtx.SemanticRequest, reqCtx); paramsErr != nil {
+				return nil, 0, paramsErr
+			}
+		}
+	}
 
 	state := &routeHeaderState{
 		setHeaders:    r.startUpstreamSpanAndInjectHeaders(dispatch, reqCtx),

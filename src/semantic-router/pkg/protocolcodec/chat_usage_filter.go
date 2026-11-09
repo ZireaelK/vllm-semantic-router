@@ -14,6 +14,12 @@ import (
 // reports as dropped. Undecorated frames retain their original bytes. A
 // provider error event ends the public stream: the filter drops it and every
 // later frame, and UpstreamFailed reports it.
+//
+// Contract Note: When client requests stream_options.include_usage=true,
+// ChatUsageStreamFilter preserves and passes through the upstream synthesis stage
+// usage chunk to match upstream provider wire semantics. Router-internal cascade
+// aggregation (panel + synthesis) is settled in SessionTelemetry and RouterReplay
+// via takeNeutralResponseUsage.
 type ChatUsageStreamFilter struct {
 	framer          sseFramer
 	stripUsage      bool
@@ -38,6 +44,14 @@ func (filter *ChatUsageStreamFilter) SetPublicModel(model string) {
 // and every frame after it; the Router sends its own error frame instead.
 var errChatUpstreamErrorFrame = errors.New("chat stream carried a provider error event")
 
+// NewChatUsageStreamFilter creates a ChatUsageStreamFilter that strips usage
+// evidence when the client did not opt into stream_options.include_usage.
+//
+// Contract Note: When client requests stream_options.include_usage=true,
+// ChatUsageStreamFilter preserves and passes through the upstream synthesis stage
+// usage chunk to match upstream provider wire semantics. Router-internal cascade
+// aggregation (panel + synthesis) is settled in SessionTelemetry and RouterReplay
+// via takeNeutralResponseUsage.
 func NewChatUsageStreamFilter(limit int) *ChatUsageStreamFilter {
 	return NewChatPublicStreamFilter(limit, false)
 }

@@ -3,11 +3,13 @@ package extproc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	http_ext "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
@@ -26,6 +28,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/looper"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay/store"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/selection"
 )
 
 func TestLooperStreamingDispatch_NativeContinue(t *testing.T) {
@@ -453,6 +456,7 @@ routing: {}
 	require.Equal(t, 19, *record.CompletionTokens)
 	require.Equal(t, 61, *record.TotalTokens)
 	require.Contains(t, record.ResponseBody, `"fusion"`)
+	require.NotContains(t, record.ResponseBody, `"analysis_mode"`)
 }
 
 func TestLooperStreamingDisconnect_PrefillBeforeResponseHeadersPersistsAuditAndReplay(t *testing.T) {
@@ -750,6 +754,27 @@ func TestBuildLooperStreamingDispatchResponse_PreservesClientSemanticRequestCont
 	require.Equal(t, originalEnvelope, reqCtx.ProtocolEnvelope, "reqCtx.ProtocolEnvelope must be restored to client's original envelope")
 }
 
+func TestBuildLooperStreamingDispatchResponse_ContextCancelledReturnsError(t *testing.T) {
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	reqCtx := &RequestContext{
+		RequestID:    "req-cancelled",
+		TraceContext: ctx,
+	}
+
+	decision := &config.Decision{Name: "test-decision"}
+	synthesisBody := []byte(`{"model":"judge","messages":[{"role":"system","content":"synthesis prompt"}]}`)
+
+	resp, n, err := router.buildLooperStreamingDispatchResponse(synthesisBody, "judge", decision, reqCtx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, resp)
+	require.Equal(t, 0, n)
+}
+
 func TestHandleLooperStreamingDispatch_ImmediateResponseRecordsIntermediateUsage(t *testing.T) {
 	memStore := store.NewMemoryStore(10, 0)
 	recorder := routerreplay.NewRecorder(memStore)
@@ -1021,7 +1046,7 @@ func TestLooperStreaming_PrepareCancelledRecordsLifecycleAborted(t *testing.T) {
 	}
 
 	resp := router.recordLooperFailureWithLifecycle(
-		reqCtx, "entrypoint", decision, 499,
+		reqCtx, "entrypoint", decision, 500,
 		"Client cancelled during looper prepare",
 		routerreplay.LifecycleAborted,
 		"client_cancelled_during_looper_prepare",
@@ -1029,10 +1054,11 @@ func TestLooperStreaming_PrepareCancelledRecordsLifecycleAborted(t *testing.T) {
 	)
 	require.NotNil(t, resp)
 	require.NotNil(t, resp.GetImmediateResponse())
+	require.Equal(t, int32(500), int32(resp.GetImmediateResponse().GetStatus().GetCode()))
 
 	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
 	require.True(t, ok)
-	require.Equal(t, 499, record.ResponseStatus)
+	require.Equal(t, 500, record.ResponseStatus)
 	require.Equal(t, routerreplay.LifecycleAborted, record.LifecycleState)
 	require.Equal(t, "client_cancelled_during_looper_prepare", record.TerminalReason)
 	require.NotNil(t, record.PromptTokens)
@@ -1040,3 +1066,855 @@ func TestLooperStreaming_PrepareCancelledRecordsLifecycleAborted(t *testing.T) {
 	require.NotNil(t, record.CompletionTokens)
 	require.Equal(t, 20, *record.CompletionTokens)
 }
+
+func TestLooperStreaming_ProtocolErrorStatusMappingAndCancellation(t *testing.T) {
+	// 1. Verify protocolErrorToHTTPStatus
+	require.Equal(t, 404, protocolErrorToHTTPStatus(llmprotocol.NewError(llmprotocol.ErrorNotFound, "not_found", "not found", nil)))
+	require.Equal(t, 401, protocolErrorToHTTPStatus(llmprotocol.NewError(llmprotocol.ErrorAuthentication, "auth", "unauthorized", nil)))
+	require.Equal(t, 403, protocolErrorToHTTPStatus(llmprotocol.NewError(llmprotocol.ErrorPermission, "perm", "forbidden", nil)))
+	require.Equal(t, 429, protocolErrorToHTTPStatus(llmprotocol.NewError(llmprotocol.ErrorRateLimited, "rate", "rate limited", nil)))
+	require.Equal(t, 504, protocolErrorToHTTPStatus(llmprotocol.NewError(llmprotocol.ErrorUpstreamTimeout, "timeout", "timeout", nil)))
+	require.Equal(t, 502, protocolErrorToHTTPStatus(llmprotocol.NewError(llmprotocol.ErrorUpstreamUnavailable, "unavailable", "unavailable", nil)))
+	require.Equal(t, 500, protocolErrorToHTTPStatus(llmprotocol.NewError(llmprotocol.ErrorInternal, "internal", "internal", nil)))
+	require.Equal(t, 400, protocolErrorToHTTPStatus(llmprotocol.NewError(llmprotocol.ErrorInvalidRequest, "bad_request", "invalid", nil)))
+	require.Equal(t, 400, protocolErrorToHTTPStatus(llmprotocol.NewError(llmprotocol.ErrorUnsupportedFeature, "feat", "unsupported", nil)))
+
+	// 2. Cancellation sets ImmediateProtocolError and status 500
+	reqCtx := &RequestContext{}
+	cancelErr := context.Canceled
+	if errors.Is(cancelErr, context.Canceled) {
+		reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInternal, "request_canceled", "request canceled", cancelErr)
+	}
+	require.NotNil(t, reqCtx.ImmediateProtocolError)
+	require.Equal(t, llmprotocol.ErrorInternal, reqCtx.ImmediateProtocolError.Category)
+	require.Equal(t, 500, protocolErrorToHTTPStatus(reqCtx.ImmediateProtocolError))
+
+	// 3. Budget error sets ImmediateProtocolError with ErrorInvalidRequest
+	budgetErr := &selection.RequestBudgetError{Code: "context_length_exceeded", Message: "exceeds context window"}
+	var asBudget *selection.RequestBudgetError
+	if errors.As(budgetErr, &asBudget) {
+		reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInvalidRequest, asBudget.Code, asBudget.Message, budgetErr)
+	}
+	require.NotNil(t, reqCtx.ImmediateProtocolError)
+	require.Equal(t, llmprotocol.ErrorInvalidRequest, reqCtx.ImmediateProtocolError.Category)
+	require.Equal(t, "context_length_exceeded", reqCtx.ImmediateProtocolError.Code)
+	require.Equal(t, "exceeds context window", reqCtx.ImmediateProtocolError.Message)
+	require.Equal(t, 400, protocolErrorToHTTPStatus(reqCtx.ImmediateProtocolError))
+
+	// 4. encodeImmediateResponseForClient syncs top-level Envoy immediate response status
+	router := &OpenAIRouter{}
+	ctx404 := &RequestContext{
+		SourceFormat:           llmprotocol.OpenAIChatV1,
+		ImmediateProtocolError: llmprotocol.NewError(llmprotocol.ErrorNotFound, "model_not_found", "model not found", nil),
+	}
+	resp := router.createErrorResponse(http.StatusBadRequest, "initial bad request")
+	require.Equal(t, uint32(http.StatusBadRequest), uint32(resp.GetImmediateResponse().GetStatus().GetCode()))
+	resp = router.encodeImmediateResponseForClient(resp, ctx404)
+	require.Equal(t, uint32(http.StatusNotFound), uint32(resp.GetImmediateResponse().GetStatus().GetCode()))
+}
+
+func TestLooperStreaming_ReplayRecordsEncodedErrorAndStatus(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{Enabled: true},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	reqCtx := &RequestContext{
+		RequestID:                "req-replay-sync-failure",
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &replayConfig,
+		SourceFormat:             llmprotocol.AnthropicMessagesV1,
+		ImmediateProtocolError:   llmprotocol.NewError(llmprotocol.ErrorNotFound, "not_found", "resource not found", nil),
+	}
+
+	decision := &config.Decision{
+		Name: "fusion-stream",
+		Algorithm: &config.AlgorithmConfig{
+			Type: config.DecisionAlgorithmFusion,
+		},
+	}
+
+	resp := router.recordLooperFailureWithLifecycle(
+		reqCtx, "entrypoint-model", decision, http.StatusBadRequest,
+		"resource not found", routerreplay.LifecycleFailed, "looper_stream_dispatch_protocol_error",
+	)
+
+	// The returned response should have status 404 from ImmediateProtocolError
+	require.Equal(t, uint32(http.StatusNotFound), uint32(resp.GetImmediateResponse().GetStatus().GetCode()))
+
+	// Replay record should have synced ResponseStatus = 404 and Anthropic wire format body
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, http.StatusNotFound, record.ResponseStatus)
+	require.Contains(t, record.ResponseBody, `"type":"error"`)
+	require.Contains(t, record.ResponseBody, `"not_found_error"`)
+
+	// Also verify recordLooperImmediateDispatchFailure synchronizes encoded body and status
+	reqCtx2 := &RequestContext{
+		RequestID:                "req-replay-sync-immediate-dispatch",
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &replayConfig,
+		SourceFormat:             llmprotocol.AnthropicMessagesV1,
+		ImmediateProtocolError:   llmprotocol.NewError(llmprotocol.ErrorRateLimited, "rate_limit_exceeded", "too many requests", nil),
+	}
+	dispatchResp := router.createErrorResponse(http.StatusBadRequest, "rate limited")
+	router.recordLooperImmediateDispatchFailure(reqCtx2, "entrypoint-model", decision, dispatchResp, looperFailureEvidence{
+		algorithm:  decision.Algorithm.Type,
+		modelsUsed: []string{"model-a"},
+		iterations: 1,
+	})
+
+	require.Equal(t, uint32(http.StatusTooManyRequests), uint32(dispatchResp.GetImmediateResponse().GetStatus().GetCode()))
+	record2, ok2 := recorder.GetRecord(reqCtx2.RouterReplayID)
+	require.True(t, ok2)
+	require.Equal(t, http.StatusTooManyRequests, record2.ResponseStatus)
+	require.Contains(t, record2.ResponseBody, `"type":"error"`)
+	require.Contains(t, record2.ResponseBody, `"rate_limit_error"`)
+}
+
+func TestLooperStreaming_CandidateRequirementsPermitsFusionAndFallback(t *testing.T) {
+	router := strictCandidateRouter()
+
+	decision := &config.Decision{
+		Name:      "fusion-stream-test",
+		ModelRefs: []config.ModelRef{{Model: "text"}},
+		Algorithm: &config.AlgorithmConfig{
+			Type: config.DecisionAlgorithmFusion,
+			Fusion: &config.FusionAlgorithmConfig{
+				Model:                "vision",
+				AnalysisModels:       []string{"text"},
+				QuorumFallbackTarget: "small",
+			},
+		},
+	}
+
+	request := &llmprotocol.Request{
+		Messages: []llmprotocol.Message{{Role: llmprotocol.RoleUser, Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: "describe"}}}},
+		Sampling: llmprotocol.Sampling{MaxOutputTokens: llmprotocol.Int64(512)},
+	}
+
+	// Case 1: When LooperStreamingActive is false and not looper hop -> denied (outside decision permission scope)
+	ctxInactive := &RequestContext{
+		VSRSelectedDecision:   decision,
+		LooperStreamingActive: false,
+		LooperRequest:         false,
+	}
+	errInactive := router.validateDispatchRequirements(request, &providerDispatch{
+		logicalModel: "vision",
+	}, ctxInactive)
+	require.Error(t, errInactive)
+	require.ErrorIs(t, errInactive, selection.ErrNoEligibleCandidates)
+
+	// Case 2: When LooperStreamingActive is true -> synthesis model allowed
+	ctxActive := &RequestContext{
+		VSRSelectedDecision:   decision,
+		LooperStreamingActive: true,
+	}
+	errActiveSynthesis := router.validateDispatchRequirements(request, &providerDispatch{
+		logicalModel: "vision",
+	}, ctxActive)
+	require.NoError(t, errActiveSynthesis)
+
+	// Case 3: When LooperStreamingActive is true -> fallback model allowed
+	errActiveFallback := router.validateDispatchRequirements(request, &providerDispatch{
+		logicalModel: "small",
+	}, ctxActive)
+	require.NoError(t, errActiveFallback)
+}
+
+func TestLooperStreaming_EmptyBody5xxMaintainsLifecycleFailed(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{Enabled: true},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	reqCtx := &RequestContext{
+		RequestID:                "req-empty-5xx",
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &replayConfig,
+		LooperStreamingActive:    true,
+		UpstreamStatusCode:       502,
+		LooperIntermediateUsage: looper.TokenUsage{
+			PromptTokens:     10,
+			CompletionTokens: 5,
+			TotalTokens:      15,
+		},
+	}
+	router.startRouterReplay(reqCtx, "entrypoint", "judge", "fusion-stream")
+
+	// Simulate EOF (empty body) on 502 response
+	err := router.handleProcessReceiveError(reqCtx, io.EOF)
+	require.NoError(t, err)
+
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+	require.Equal(t, "upstream_error_response", record.TerminalReason)
+}
+
+func TestLooperStreaming_TelemetryAndEstimatorIsolation(t *testing.T) {
+	reqCtx := &RequestContext{
+		RequestID:             "req-telemetry-isolation",
+		RequestModel:          "virtual-entrypoint",
+		LooperStreamingActive: true,
+		LooperTargetModel:     "physical-judge",
+	}
+
+	// recordStreamingTTFT skips metrics and cache probability on RequestModel
+	recordStreamingTTFT(reqCtx)
+	require.Zero(t, reqCtx.CacheWarmthEstimate)
+
+	// calibrateTokenEstimatorForModel uses byteLen for context_compression when LooperStreamingActive
+	classifier, err := classification.BuildClassifier(&config.RouterConfig{
+		IntelligentRouting: config.IntelligentRouting{
+			Signals: config.Signals{
+				ContextRules: []config.ContextRule{{
+					Name:      "beyond_window",
+					MinTokens: config.TokenCount("200K"),
+				}},
+			},
+		},
+	}, nil, nil, nil)
+	require.NoError(t, err)
+
+	router := &OpenAIRouter{
+		Classifier: classifier,
+		Config: &config.RouterConfig{
+			BackendModels: config.BackendModels{
+				ModelConfig: map[string]config.ModelParams{
+					"physical-judge": {Capabilities: []string{"chat"}},
+				},
+			},
+		},
+	}
+
+	reqCtx.Routing.SelectRecipe(&config.RoutingRecipe{Name: config.DefaultRecipeName})
+	reqCtx.LooperSynthesisTextBytes = 1234
+	router.calibrateTokenEstimatorForModel(reqCtx, "physical-judge", 1234, 100)
+
+	// reportSemanticStreamingUsage skips single-model metrics and TPOT updates when LooperStreamingActive
+	router.reportSemanticStreamingUsage(reqCtx, 100*time.Millisecond, responseUsageMetrics{
+		promptTokens:     10,
+		completionTokens: 20,
+	})
+}
+
+func TestLooperStreaming_MaskingErrorMapsTo503(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{Enabled: true},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	reqCtx := &RequestContext{
+		RequestID:                "req-masking-503",
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &replayConfig,
+	}
+
+	decision := &config.Decision{
+		Name:      "fusion-masking",
+		Algorithm: &config.AlgorithmConfig{Type: config.DecisionAlgorithmFusion},
+	}
+
+	maskingErr := &maskingDispatchError{cause: errors.New("pii service unavailable")}
+	var matchedMaskingErr *maskingDispatchError
+	require.True(t, errors.As(maskingErr, &matchedMaskingErr))
+
+	resp := router.recordLooperFailureWithLifecycle(
+		reqCtx, "entrypoint", decision, http.StatusServiceUnavailable,
+		maskingUnavailableMessage, routerreplay.LifecycleFailed,
+		"looper_stream_dispatch_masking_unavailable",
+		looperFailureEvidence{
+			algorithm: decision.Algorithm.Type,
+			usage: looper.TokenUsage{
+				PromptTokens:     120,
+				CompletionTokens: 45,
+				TotalTokens:      165,
+			},
+		},
+	)
+
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.GetImmediateResponse())
+	require.Equal(t, int32(503), int32(resp.GetImmediateResponse().GetStatus().GetCode()))
+
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, 503, record.ResponseStatus)
+	require.Equal(t, "looper_stream_dispatch_masking_unavailable", record.TerminalReason)
+	require.NotNil(t, record.PromptTokens)
+	require.Equal(t, 120, *record.PromptTokens)
+	require.NotNil(t, record.CompletionTokens)
+	require.Equal(t, 45, *record.CompletionTokens)
+
+	// Verify that when streaming dispatch encounters a maskingDispatchError,
+	// handleLooperStreamingDispatch maps it to 503 and "looper_stream_dispatch_masking_unavailable",
+	// and persists intermediate token usage into replay.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqPayload struct {
+			Model string `json:"model"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&reqPayload))
+		writeFusionReplayCompletion(w, reqPayload.Model, []map[string]interface{}{{
+			"index": 0,
+			"message": map[string]interface{}{
+				"role":    "assistant",
+				"content": "Panel answer from " + reqPayload.Model,
+			},
+			"finish_reason": "stop",
+		}}, map[string]int64{"prompt_tokens": 120, "completion_tokens": 45, "total_tokens": 165})
+	}))
+	defer server.Close()
+
+	streamRouter, streamReqCtx, protoReq := quorumFallbackRouter(server.URL)
+	streamRouter.Config.ClearRouteCache = true
+	streamReqCtx.ExpectStreamingResponse = true
+	protoReq.Stream = true
+
+	streamDecision := &config.Decision{
+		Name: "fusion-stream-masking",
+		Algorithm: &config.AlgorithmConfig{
+			Type: config.DecisionAlgorithmFusion,
+			Fusion: &config.FusionAlgorithmConfig{
+				Model:          "judge",
+				AnalysisModels: []string{"panel-a"},
+				AnalysisMode:   config.FusionAnalysisModeOneCall,
+			},
+		},
+		Plugins: []config.DecisionPlugin{{
+			Type:          config.DecisionPluginMasking,
+			Configuration: config.MustStructuredPayload(map[string]interface{}{"enabled": true}),
+		}},
+	}
+	streamReqCtx.VSRSelectedDecision = streamDecision
+
+	looperReq, errResp := streamRouter.buildLooperRequest(protoReq, streamDecision, streamReqCtx)
+	require.Nil(t, errResp)
+	require.NotNil(t, looperReq)
+
+	streamResp, err := streamRouter.handleLooperStreamingDispatch(context.Background(), looperReq, streamDecision, protoReq.Model, streamReqCtx)
+	require.NoError(t, err)
+	require.NotNil(t, streamResp)
+	require.NotNil(t, streamResp.GetImmediateResponse())
+	require.Equal(t, int32(503), int32(streamResp.GetImmediateResponse().GetStatus().GetCode()))
+
+	streamRecord, ok := streamRouter.ReplayRecorder.GetRecord(streamReqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, 503, streamRecord.ResponseStatus)
+	require.Equal(t, "looper_stream_dispatch_masking_unavailable", streamRecord.TerminalReason)
+	require.NotNil(t, streamRecord.PromptTokens)
+	require.Equal(t, 120, *streamRecord.PromptTokens)
+	require.NotNil(t, streamRecord.CompletionTokens)
+	require.Equal(t, 45, *streamRecord.CompletionTokens)
+}
+
+func TestLooperStreaming_NonStreamingResponseBodyProtection(t *testing.T) {
+	router := &OpenAIRouter{}
+
+	reqCtx := &RequestContext{
+		RequestID:             "req-non-streaming-guard",
+		RequestModel:          "virtual-entrypoint",
+		LooperStreamingActive: true,
+		InflightToken:         100,
+	}
+
+	// When LooperStreamingActive is true, reportNonStreamingUsage does not panic and uses empty pricing
+	router.reportNonStreamingUsage(reqCtx, 100*time.Millisecond, responseUsageMetrics{
+		promptTokens:     50,
+		completionTokens: 25,
+	})
+	// Inflight token should be cleared
+	require.Equal(t, uint64(0), reqCtx.InflightToken)
+
+	// Verify non-streaming response body handling under LooperStreamingActive:
+	// Settles usage, records both synthesized and intermediate tokens into Replay,
+	// and prevents subsequent EOF from overwriting usage or marking aborted.
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+	router.Config = &config.RouterConfig{
+		RouterReplay: config.RouterReplayConfig{Enabled: true},
+	}
+	router.ReplayRecorder = recorder
+
+	reqCtx.RouterReplayRecorder = recorder
+	reqCtx.RouterReplayPluginConfig = &replayConfig
+	reqCtx.LooperIntermediateUsage = looper.TokenUsage{
+		PromptTokens:     30,
+		CompletionTokens: 20,
+		TotalTokens:      50,
+	}
+	router.startRouterReplay(reqCtx, "virtual-entrypoint", "judge", "fusion-stream")
+	require.NotEmpty(t, reqCtx.RouterReplayID)
+
+	responseBody := []byte(`{
+		"id": "chatcmpl-nonstream",
+		"object": "chat.completion",
+		"created": 1700000000,
+		"model": "judge",
+		"choices": [{"index": 0, "message": {"role": "assistant", "content": "Done"}, "finish_reason": "stop"}],
+		"usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+	}`)
+
+	resp := router.handleNonStreamingResponseBody(responseBody, reqCtx, 100*time.Millisecond)
+	require.NotNil(t, resp)
+	require.True(t, reqCtx.LooperUsageSettled)
+
+	// Verify model rewrite in response body mutation
+	bodyMutation := resp.GetResponseBody().GetResponse().GetBodyMutation().GetBody()
+	require.NotEmpty(t, bodyMutation)
+	var clientResp map[string]interface{}
+	require.NoError(t, json.Unmarshal(bodyMutation, &clientResp))
+	require.Equal(t, "virtual-entrypoint", clientResp["model"])
+
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.NotNil(t, record.PromptTokens)
+	require.NotNil(t, record.CompletionTokens)
+	require.NotNil(t, record.TotalTokens)
+	require.Equal(t, 40, *record.PromptTokens)     // 10 + 30
+	require.Equal(t, 25, *record.CompletionTokens) // 5 + 20
+	require.Equal(t, 65, *record.TotalTokens)      // 15 + 50
+
+	// Verify EOF does not overwrite usage or mark aborted
+	err := router.handleProcessReceiveError(reqCtx, io.EOF)
+	require.NoError(t, err)
+	require.False(t, reqCtx.StreamingAborted)
+
+	recordAfterEOF, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, 40, *recordAfterEOF.PromptTokens)
+	require.Equal(t, 25, *recordAfterEOF.CompletionTokens)
+	require.Equal(t, 65, *recordAfterEOF.TotalTokens)
+}
+
+func TestLooperStreaming_NonStreamingResponseModelRewriteAndTraceMounting(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{Enabled: true},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	reqCtx := &RequestContext{
+		RequestID:                "req-nonstream-model-trace",
+		RequestModel:             "virtual-entrypoint",
+		LooperStreamingActive:    true,
+		VSRSelectionMethod:       config.DecisionAlgorithmFusion,
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &replayConfig,
+		LooperTrace: &looper.FusionTrace{
+			AnalysisMode: config.FusionAnalysisModeOneCall,
+			Analysis: &looper.FusionAnalysis{
+				Consensus: []string{"consensus item"},
+			},
+			Responses: []looper.FusionPanelResponse{
+				{Model: "panel-a", Content: "panel response"},
+			},
+			FailedModels: []looper.FusionFailedModel{
+				{Model: "panel-b", Error: "500 error"},
+			},
+			JudgeModel: "physical-judge",
+		},
+	}
+
+	router.startRouterReplay(reqCtx, "virtual-entrypoint", "physical-judge", "fusion-stream")
+	require.NotEmpty(t, reqCtx.RouterReplayID)
+
+	responseBody := []byte(`{
+		"id": "chatcmpl-test",
+		"object": "chat.completion",
+		"created": 1700000000,
+		"model": "physical-judge",
+		"choices": [{"index": 0, "message": {"role": "assistant", "content": "Done"}, "finish_reason": "stop"}],
+		"usage": {"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18}
+	}`)
+
+	resp := router.handleNonStreamingResponseBody(responseBody, reqCtx, 100*time.Millisecond)
+	require.NotNil(t, resp)
+
+	// 1. Client wire body: model must be rewritten to RequestModel ("virtual-entrypoint")
+	clientBody := resp.GetResponseBody().GetResponse().GetBodyMutation().GetBody()
+	require.NotEmpty(t, clientBody)
+	var clientJSON map[string]interface{}
+	require.NoError(t, json.Unmarshal(clientBody, &clientJSON))
+	require.Equal(t, "virtual-entrypoint", clientJSON["model"], "public model name must be rewritten to requested model")
+	_, clientHasFusion := clientJSON["fusion"]
+	require.False(t, clientHasFusion, "client wire body must not leak fusion trace")
+
+	// 2. Replay snapshot: must contain projected fusion trace, with analysis_mode stripped
+	rec, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.NotEmpty(t, rec.ResponseBody)
+	var replayJSON map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(rec.ResponseBody), &replayJSON))
+	fusionVal, hasFusion := replayJSON["fusion"]
+	require.True(t, hasFusion, "replay snapshot must have fusion trace attached")
+	fusionMap, ok := fusionVal.(map[string]interface{})
+	require.True(t, ok)
+	_, hasAnalysisMode := fusionMap["analysis_mode"]
+	require.False(t, hasAnalysisMode, "internal analysis_mode must not leak into replay snapshot")
+	require.Equal(t, "physical-judge", fusionMap["judge_model"])
+}
+
+func TestLooperStreaming_NonStreamingResponseCalibratorIsolation(t *testing.T) {
+	classifier, err := classification.BuildClassifier(&config.RouterConfig{
+		IntelligentRouting: config.IntelligentRouting{
+			Signals: config.Signals{
+				ContextRules: []config.ContextRule{{
+					Name:      "beyond_window",
+					MinTokens: config.TokenCount("200K"),
+				}},
+			},
+		},
+	}, nil, nil, nil)
+	require.NoError(t, err)
+
+	router := &OpenAIRouter{
+		Classifier: classifier,
+		Config: &config.RouterConfig{
+			BackendModels: config.BackendModels{
+				ModelConfig: map[string]config.ModelParams{
+					"physical-judge": {Capabilities: []string{"chat"}},
+				},
+			},
+		},
+	}
+
+	reqCtx := &RequestContext{
+		RequestID:                "req-calibrator-test",
+		RequestModel:             "virtual-entrypoint",
+		LooperStreamingActive:    true,
+		LooperTargetModel:        "physical-judge",
+		LooperSynthesisTextBytes: 8000,
+		LooperIntermediateUsage: looper.TokenUsage{
+			PromptTokens:     20000,
+			CompletionTokens: 5000,
+			TotalTokens:      25000,
+		},
+	}
+	reqCtx.Routing.SelectRecipe(&config.RoutingRecipe{Name: config.DefaultRecipeName})
+
+	// Upstream 200 response with synthesis prompt_tokens = 2000
+	responseBody := []byte(`{
+		"id": "chatcmpl-calib",
+		"object": "chat.completion",
+		"created": 1700000000,
+		"model": "physical-judge",
+		"choices": [{"index": 0, "message": {"role": "assistant", "content": "Done"}, "finish_reason": "stop"}],
+		"usage": {"prompt_tokens": 2000, "completion_tokens": 500, "total_tokens": 2500}
+	}`)
+
+	resp := router.handleNonStreamingResponseBody(responseBody, reqCtx, 100*time.Millisecond)
+	require.NotNil(t, resp)
+
+	// Calibrator must observe synthesis bytes (8000) / synthesis prompt tokens (2000) = 4.0
+	// If it mistakenly used intermediate + synthesis = 22000 tokens, ratio would be 8000 / 22000 = 0.3636
+	mean, _, samples, _ := classifier.TokenCalibrationRatio("model:physical-judge")
+	require.Equal(t, int64(1), samples)
+	require.InDelta(t, 4.0, mean, 0.001)
+}
+
+func TestLooperStreaming_NonStreamingResponseInvalidUsageSettlement(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{Enabled: true},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	reqCtx := &RequestContext{
+		RequestID:                "req-invalid-usage",
+		RequestModel:             "virtual-entrypoint",
+		LooperStreamingActive:    true,
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &replayConfig,
+		LooperIntermediateUsage: looper.TokenUsage{
+			PromptTokens:     35,
+			CompletionTokens: 25,
+			TotalTokens:      60,
+		},
+	}
+	router.startRouterReplay(reqCtx, "virtual-entrypoint", "judge", "fusion-stream")
+	require.NotEmpty(t, reqCtx.RouterReplayID)
+
+	// Upstream 200 response missing "usage" field entirely
+	responseBody := []byte(`{
+		"id": "chatcmpl-nousage",
+		"object": "chat.completion",
+		"created": 1700000000,
+		"model": "judge",
+		"choices": [{"index": 0, "message": {"role": "assistant", "content": "Done"}, "finish_reason": "stop"}]
+	}`)
+
+	resp := router.handleNonStreamingResponseBody(responseBody, reqCtx, 100*time.Millisecond)
+	require.NotNil(t, resp)
+
+	// Must settle aborted looper streaming usage:
+	// LooperUsageSettled and StreamingAborted should be true
+	require.True(t, reqCtx.LooperUsageSettled, "usage must be marked settled")
+	require.True(t, reqCtx.StreamingAborted, "streaming must be marked aborted on invalid usage")
+
+	// Intermediate usage must be preserved and settled into Replay, NOT zeroed out
+	rec, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.NotNil(t, rec.PromptTokens)
+	require.NotNil(t, rec.CompletionTokens)
+	require.NotNil(t, rec.TotalTokens)
+	require.Equal(t, 35, *rec.PromptTokens)
+	require.Equal(t, 25, *rec.CompletionTokens)
+	require.Equal(t, 60, *rec.TotalTokens)
+}
+
+func TestLooperStreaming_ReplaySnapshotFusionProjection(t *testing.T) {
+	ctx := &RequestContext{
+		LooperStreamingActive: true,
+		VSRSelectionMethod:    config.DecisionAlgorithmFusion,
+		LooperTrace: &looper.FusionTrace{
+			AnalysisMode: config.FusionAnalysisModeOneCall,
+			Analysis: &looper.FusionAnalysis{
+				Consensus: []string{"consensus item"},
+			},
+			Responses: []looper.FusionPanelResponse{
+				{Model: "panel-a", Content: "panel response"},
+			},
+			FailedModels: []looper.FusionFailedModel{
+				{Model: "panel-b", Error: "500 error"},
+			},
+			JudgeModel: "judge",
+		},
+	}
+
+	rawResponse := []byte(`{"id":"chatcmpl-test","choices":[{"index":0,"message":{"role":"assistant","content":"hello"}}]}`)
+	result := attachLooperTraceToReplaySnapshot(ctx, rawResponse)
+	require.NotEmpty(t, result)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(result, &parsed))
+
+	fusionVal, hasFusion := parsed["fusion"]
+	require.True(t, hasFusion, "fusion trace should be attached to replay snapshot")
+
+	fusionMap, ok := fusionVal.(map[string]interface{})
+	require.True(t, ok, "fusion should be a JSON object")
+
+	// analysis_mode must NOT be present (sanitized/projected via ProjectFusionPublicTrace)
+	_, hasAnalysisMode := fusionMap["analysis_mode"]
+	require.False(t, hasAnalysisMode, "internal analysis_mode must not leak into replay snapshot")
+
+	// Public fields must be present
+	require.Equal(t, "judge", fusionMap["judge_model"])
+	require.NotNil(t, fusionMap["analysis"])
+	require.NotNil(t, fusionMap["responses"])
+	require.NotNil(t, fusionMap["failed_models"])
+}
+
+func TestLooperStreamingDispatch_LegacyEndpointAppliesRequestParams(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Model string `json:"model"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		writeFusionReplayCompletion(w, request.Model, []map[string]interface{}{{
+			"index": 0,
+			"message": map[string]interface{}{
+				"role":    "assistant",
+				"content": "Panel answer from " + request.Model,
+			},
+			"finish_reason": "stop",
+		}}, map[string]int64{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+	}))
+	defer server.Close()
+
+	router, reqCtx, request := quorumFallbackRouter(server.URL)
+	router.Config.ClearRouteCache = true
+	reqCtx.ExpectStreamingResponse = true
+	request.Stream = true
+	request.Sampling.MaxOutputTokens = llmprotocol.Int64(2048)
+
+	limit := 64
+	decision := &config.Decision{
+		Name: "fusion-stream-params",
+		Algorithm: &config.AlgorithmConfig{
+			Type: config.DecisionAlgorithmFusion,
+			Fusion: &config.FusionAlgorithmConfig{
+				Model:          "judge",
+				AnalysisModels: []string{"panel-a", "panel-b"},
+				AnalysisMode:   config.FusionAnalysisModeOneCall,
+			},
+		},
+		Plugins: []config.DecisionPlugin{
+			{
+				Type: "request_params",
+				Configuration: config.MustStructuredPayload(map[string]interface{}{
+					"max_tokens_limit": limit,
+				}),
+			},
+		},
+	}
+	reqCtx.VSRSelectedDecision = decision
+	reqCtx.VSRSelectedDecisionName = decision.Name
+
+	response, err := router.handleLooperExecution(context.Background(), request, decision, reqCtx)
+	require.NoError(t, err)
+	require.NotNil(t, response)
+	require.Nil(t, response.GetImmediateResponse())
+
+	body := response.GetRequestBody().GetResponse().GetBodyMutation().GetBody()
+	var dispatchedPayload map[string]interface{}
+	require.NoError(t, json.Unmarshal(body, &dispatchedPayload))
+
+	// Max tokens limit of 64 should be applied
+	if maxCompletionTokens, ok := dispatchedPayload["max_completion_tokens"].(float64); ok {
+		require.Equal(t, float64(64), maxCompletionTokens)
+	} else if maxTokens, ok := dispatchedPayload["max_tokens"].(float64); ok {
+		require.Equal(t, float64(64), maxTokens)
+	} else {
+		t.Fatalf("neither max_completion_tokens nor max_tokens found in dispatched payload: %v", dispatchedPayload)
+	}
+}
+
+func TestLooperStreamingDispatch_BuildResponseDoesNotMutateClientRequest(t *testing.T) {
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			Looper: config.LooperConfig{
+				Endpoint: "http://looper.legacy.local",
+			},
+		},
+	}
+	clientReq := &llmprotocol.Request{
+		Model: "client-model",
+		Sampling: llmprotocol.Sampling{
+			MaxOutputTokens: llmprotocol.Int64(2048),
+		},
+	}
+	decision := &config.Decision{
+		Name: "test-decision",
+		Plugins: []config.DecisionPlugin{
+			{
+				Type: "request_params",
+				Configuration: config.MustStructuredPayload(map[string]interface{}{
+					"max_tokens_limit": 64,
+				}),
+			},
+		},
+	}
+	reqCtx := &RequestContext{
+		RequestID:              "req-legacy-test",
+		SourceFormat:           llmprotocol.OpenAIChatV1,
+		SemanticRequest:        clientReq,
+		VSRSelectedDecision:     decision,
+		VSRSelectedDecisionName: decision.Name,
+	}
+
+	rawSynthesis := []byte(`{"model":"synth-model","messages":[{"role":"user","content":"hi"}],"max_tokens":500}`)
+	resp, _, err := router.buildLooperStreamingDispatchResponse(rawSynthesis, "synth-model", decision, reqCtx)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	// Dispatched synthesis body has request_params applied (500 capped to 64)
+	body := resp.GetRequestBody().GetResponse().GetBodyMutation().GetBody()
+	var dispatched map[string]interface{}
+	require.NoError(t, json.Unmarshal(body, &dispatched))
+	if maxTokens, ok := dispatched["max_tokens"].(float64); ok {
+		require.Equal(t, float64(64), maxTokens)
+	} else if maxCompletionTokens, ok := dispatched["max_completion_tokens"].(float64); ok {
+		require.Equal(t, float64(64), maxCompletionTokens)
+	} else {
+		t.Fatalf("neither max_tokens nor max_completion_tokens found: %v", dispatched)
+	}
+
+	// Client request restored after deferred exit must NOT have had request_params applied
+	require.Equal(t, clientReq, reqCtx.SemanticRequest)
+	require.Equal(t, int64(2048), *clientReq.Sampling.MaxOutputTokens)
+}
+
+func TestLooperExecutionErrorResponse_SanitizesClientVisibleMessage(t *testing.T) {
+	router := &OpenAIRouter{}
+	reqCtx := &RequestContext{
+		RequestID:    "req-123",
+		SourceFormat: llmprotocol.OpenAIChatV1,
+	}
+	decision := &config.Decision{
+		Name: "test-decision",
+		Algorithm: &config.AlgorithmConfig{
+			Type: config.DecisionAlgorithmConfidence,
+		},
+	}
+	internalErr := errors.New("upstream connection refused at 10.0.0.123:8080: secret internal failure")
+	resp := router.looperExecutionErrorResponse(internalErr, "original-model", decision, reqCtx)
+	require.NotNil(t, resp)
+	require.NotNil(t, reqCtx.ImmediateProtocolError)
+	// Must not leak internal details to client-visible protocol error
+	require.Equal(t, "Looper execution failed", reqCtx.ImmediateProtocolError.Message)
+	require.Equal(t, "looper_execution_failed", reqCtx.ImmediateProtocolError.Code)
+	require.Equal(t, llmprotocol.ErrorInternal, reqCtx.ImmediateProtocolError.Category)
+	// Raw cause is preserved internally
+	require.ErrorIs(t, reqCtx.ImmediateProtocolError, internalErr)
+
+	// Encoded immediate response payload should contain sanitized message and NOT leak internal error text
+	immediate := resp.GetImmediateResponse()
+	require.NotNil(t, immediate)
+	bodyStr := string(immediate.GetBody())
+	require.Contains(t, bodyStr, "Looper execution failed")
+	require.NotContains(t, bodyStr, "10.0.0.123:8080")
+	require.NotContains(t, bodyStr, "secret internal failure")
+}
+
+func TestLooperFailureEvidenceFromError_FusionStageFailureError(t *testing.T) {
+	stageErr := looper.NewFusionStageFailureError(
+		errors.New("judge model overloaded"),
+		[]string{"panel-a", "panel-b", "judge"},
+		3,
+		looper.TokenUsage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150},
+	)
+	evidence, ok := looperFailureEvidenceFromError(stageErr)
+	require.True(t, ok)
+	require.Equal(t, config.DecisionAlgorithmFusion, evidence.algorithm)
+	require.Equal(t, []string{"panel-a", "panel-b", "judge"}, evidence.modelsUsed)
+	require.Equal(t, 3, evidence.iterations)
+	require.Equal(t, int64(150), evidence.usage.TotalTokens)
+	require.Nil(t, evidence.fusionQuorum, "fusionQuorum must remain nil to avoid false quorum alarm")
+
+	router := &OpenAIRouter{}
+	reqCtx := &RequestContext{
+		RequestID:    "req-stage-fail",
+		SourceFormat: llmprotocol.OpenAIChatV1,
+	}
+	decision := &config.Decision{
+		Name: "test-fusion-stage",
+		Algorithm: &config.AlgorithmConfig{
+			Type: config.DecisionAlgorithmFusion,
+		},
+	}
+	resp := router.looperExecutionErrorResponse(stageErr, "original-model", decision, reqCtx)
+	require.NotNil(t, resp)
+	require.Nil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must not be populated when quorum was met")
+}
+

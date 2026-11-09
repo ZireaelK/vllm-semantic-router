@@ -48,6 +48,11 @@ func (u TokenUsage) Add(resps ...*ModelResponse) TokenUsage {
 	return u
 }
 
+// IsZero reports whether the usage counters are all zero.
+func (u TokenUsage) IsZero() bool {
+	return u.PromptTokens == 0 && u.CompletionTokens == 0 && u.TotalTokens == 0
+}
+
 // SumUsage sums the per-call usage of the given responses. nil responses are
 // skipped. The total is computed from each response's reported prompt and
 // completion tokens; TotalTokens is taken from the backend rather than

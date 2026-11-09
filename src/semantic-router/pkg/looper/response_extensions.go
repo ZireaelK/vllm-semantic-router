@@ -41,7 +41,7 @@ func withFusionExtension(response *Response, cfg fusionExecutionConfig, trace *F
 	if !shouldIncludeFusionTrace(cfg, trace) {
 		return response, nil
 	}
-	return withRouterExtension(response, "fusion", projectFusionPublicTrace(trace))
+	return withRouterExtension(response, "fusion", ProjectFusionPublicTrace(trace))
 }
 
 func withWorkflowExtension(response *Response, cfg workflowsExecutionConfig, trace *workflowTrace) (*Response, error) {

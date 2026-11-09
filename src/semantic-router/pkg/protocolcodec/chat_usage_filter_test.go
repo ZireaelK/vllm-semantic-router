@@ -216,3 +216,62 @@ func TestChatPublicStreamFilterTreatsNullErrorAsData(t *testing.T) {
 		t.Fatal("a nil filter reported a provider error")
 	}
 }
+
+func TestChatPublicStreamFilterPreservesTrailingUsageChunkWhenOptedIn(t *testing.T) {
+	frames := [][]byte{
+		[]byte("data: {\"id\":\"synthesis_1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"result\"},\"finish_reason\":null}]}\n\n"),
+		[]byte("data: {\"id\":\"synthesis_1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"),
+		[]byte("data: {\"id\":\"synthesis_1\",\"choices\":[],\"usage\":{\"prompt_tokens\":18,\"completion_tokens\":7,\"total_tokens\":25}}\n\n"),
+		[]byte("data: [DONE]\n\n"),
+	}
+
+	t.Run("opted in preserves trailing usage chunk", func(t *testing.T) {
+		filter := NewChatPublicStreamFilter(1<<20, true)
+		var output []byte
+		for _, frame := range frames {
+			out, err := filter.Push(frame)
+			if err != nil {
+				t.Fatalf("push failed: %v", err)
+			}
+			output = append(output, out...)
+		}
+		final, err := filter.Finalize()
+		if err != nil {
+			t.Fatalf("finalize failed: %v", err)
+		}
+		output = append(output, final...)
+
+		outStr := string(output)
+		if !strings.Contains(outStr, `"usage":{"prompt_tokens":18,"completion_tokens":7,"total_tokens":25}`) {
+			t.Fatalf("expected output to preserve trailing usage chunk, got: %s", outStr)
+		}
+		if !strings.Contains(outStr, "data: [DONE]\n\n") {
+			t.Fatalf("expected terminal sentinel [DONE], got: %s", outStr)
+		}
+	})
+
+	t.Run("opted out strips trailing usage chunk", func(t *testing.T) {
+		filter := NewChatUsageStreamFilter(1 << 20)
+		var output []byte
+		for _, frame := range frames {
+			out, err := filter.Push(frame)
+			if err != nil {
+				t.Fatalf("push failed: %v", err)
+			}
+			output = append(output, out...)
+		}
+		final, err := filter.Finalize()
+		if err != nil {
+			t.Fatalf("finalize failed: %v", err)
+		}
+		output = append(output, final...)
+
+		outStr := string(output)
+		if strings.Contains(outStr, `"usage"`) {
+			t.Fatalf("expected output to strip trailing usage chunk, got: %s", outStr)
+		}
+		if !strings.Contains(outStr, "data: [DONE]\n\n") {
+			t.Fatalf("expected terminal sentinel [DONE], got: %s", outStr)
+		}
+	})
+}

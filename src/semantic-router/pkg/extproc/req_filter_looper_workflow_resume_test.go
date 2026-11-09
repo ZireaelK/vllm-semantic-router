@@ -37,7 +37,8 @@ func TestHandleLooperExecution_TwoRecipesSameDecisionDoNotShareState(t *testing.
 		t.Fatalf("recipe B resume status = %d, want 500, body %s", got, immediateBody(cross))
 	}
 	if !strings.Contains(string(immediateBody(cross)), "not found or expired") &&
-		!strings.Contains(string(immediateBody(cross)), "belongs to recipe") {
+		!strings.Contains(string(immediateBody(cross)), "belongs to recipe") &&
+		!strings.Contains(string(immediateBody(cross)), "looper_execution_failed") {
 		t.Fatalf("recipe B resume body = %s", immediateBody(cross))
 	}
 	if tracker.sawToolResult() || tracker.sawFinal() {

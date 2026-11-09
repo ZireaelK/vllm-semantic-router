@@ -142,7 +142,7 @@ func (r *OpenAIRouter) validateDispatchRequirements(request *llmprotocol.Request
 		if decision.Action != nil && decision.Action.Type == config.DecisionActionRoute {
 			allowed = allowed || r.Config.ModelNameMatches(decision.Action.Destination, dispatch.logicalModel)
 		}
-		if r.isLooperRequest(ctx) {
+		if r.isLooperRequest(ctx) || (ctx != nil && ctx.LooperStreamingActive) {
 			for _, model := range explicitAlgorithmModels(decision.Algorithm) {
 				allowed = allowed || (model != "" && r.Config.ModelNameMatches(model, dispatch.logicalModel))
 			}

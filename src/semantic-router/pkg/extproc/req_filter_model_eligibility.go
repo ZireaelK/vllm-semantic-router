@@ -203,6 +203,9 @@ func explicitAlgorithmModels(algorithm *config.AlgorithmConfig) []string {
 	if fusion := algorithm.Fusion; fusion != nil {
 		models = append(models, fusion.Model)
 		models = append(models, fusion.AnalysisModels...)
+		if fusion.QuorumFallbackTarget != "" {
+			models = append(models, fusion.QuorumFallbackTarget)
+		}
 	}
 	if remom := algorithm.ReMoM; remom != nil {
 		models = append(models, remom.SynthesisModel)

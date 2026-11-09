@@ -28,8 +28,14 @@ func (l *FusionLooper) runFusionJudgeStages(
 ) (fusionJudgeOutcome, error) {
 	switch cfg.AnalysisMode {
 	case config.FusionAnalysisModeSeparate:
-		analysis, analysisResp := l.runFusionAnalysis(
+		analysis, analysisResp, analysisErr := l.runFusionAnalysis(
 			ctx, req, cfg, panelResponses, groundingScores, firstJudgeOrdinal)
+		if analysisErr != nil {
+			return fusionJudgeOutcome{
+				analysis:         analysis,
+				analysisResponse: analysisResp,
+			}, analysisErr
+		}
 		finalResp, err := l.runFusionFinal(
 			ctx, req, cfg, panelResponses, analysis, groundingScores, firstJudgeOrdinal+1)
 		return fusionJudgeOutcome{
