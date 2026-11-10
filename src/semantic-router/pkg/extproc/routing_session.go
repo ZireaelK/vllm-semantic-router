@@ -164,12 +164,22 @@ func (s *routingSession) Close(err error) {
 	transportErr := io.EOF
 	switch {
 	case err == nil:
-	case errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded ||
+		(s.ctx != nil && s.ctx.Context != nil && errors.Is(s.ctx.Context.Err(), context.DeadlineExceeded)):
 		transportErr = context.DeadlineExceeded
-	default:
+	case (s.ctx != nil && s.ctx.Context != nil && errors.Is(s.ctx.Context.Err(), context.Canceled)) ||
+		(s.ctx != nil && s.ctx.TraceContext != nil && errors.Is(s.ctx.TraceContext.Err(), context.Canceled)) ||
+		errors.Is(err, context.Canceled) ||
+		status.Code(err) == codes.Canceled:
 		transportErr = context.Canceled
+	default:
+		transportErr = err
 	}
-	s.end(s.router.handleProcessReceiveError(s.ctx, transportErr))
+	if s.router != nil {
+		s.end(s.router.handleProcessReceiveError(s.ctx, transportErr))
+	} else {
+		s.end(transportErr)
+	}
 }
 
 // phase runs one reply builder with Process's failure semantics: a panic or

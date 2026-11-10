@@ -237,6 +237,16 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 	}
 	var ledger *budget.Ledger
 	ctx, ledger = budget.WithLimit(ctx, limit)
+	if reqCtx != nil {
+		if reqCtx.TraceContext != nil {
+			reqCtx.TraceContext = budget.WithLedger(reqCtx.TraceContext, ledger)
+		} else {
+			reqCtx.TraceContext = ctx
+		}
+		if reqCtx.Context != nil {
+			reqCtx.Context = budget.WithLedger(reqCtx.Context, ledger)
+		}
+	}
 
 	runtimeConfig := r.Config.Looper
 	for _, entrypoint := range r.Config.EffectiveEntrypoints(config.ChatAPI) {
@@ -303,6 +313,9 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 		} else if plan != nil && plan.QuorumOutcome != nil {
 			quorumOutcome = plan.QuorumOutcome
 		}
+		if errors.Is(err, budget.ErrExhausted) && quorumOutcome != nil {
+			quorumOutcome.Disposition = looper.FusionQuorumBudgetExhausted
+		}
 		finalizeLooperQuorumOutcome(reqCtx, quorumOutcome, decision, false)
 
 		statusCode := 502
@@ -325,13 +338,6 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 			msg = "Client cancelled during looper prepare"
 			if reqCtx != nil {
 				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInternal, "request_canceled", "request canceled", err)
-			}
-		} else if errors.As(err, &windowErr) || (quorumOutcome != nil && quorumOutcome.Disposition == looper.FusionQuorumBudgetExhausted) {
-			statusCode = 400
-			reason = "looper_stage_context_exceeded"
-			msg = "Looper stage context window exceeded"
-			if reqCtx != nil {
-				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInvalidRequest, "context_length_exceeded", "Looper stage context window exceeded", err)
 			}
 		} else if errors.Is(err, budget.ErrExhausted) {
 			statusCode = 400
@@ -356,6 +362,13 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 				"hops":       observed,
 				"calls":      observed,
 			})
+		} else if errors.As(err, &windowErr) {
+			statusCode = 400
+			reason = "looper_stage_context_exceeded"
+			msg = "Looper stage context window exceeded"
+			if reqCtx != nil {
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInvalidRequest, "context_length_exceeded", "Looper stage context window exceeded", err)
+			}
 		}
 
 		return r.recordLooperFailureWithLifecycle(
@@ -420,10 +433,34 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 	}
 
 	dispatchResponse, synthesisTextBytes, err := r.buildLooperStreamingDispatchResponse(
-		rawSynthesisBody, targetModel, decision, reqCtx,
+		ctx, rawSynthesisBody, targetModel, decision, reqCtx,
 	)
 	if err != nil {
-		finalizeLooperQuorumOutcome(reqCtx, plan.QuorumOutcome, decision, false)
+		isDeadlineExceeded := errors.Is(err, context.DeadlineExceeded) ||
+			(ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded)) ||
+			(reqCtx != nil && reqCtx.TraceContext != nil && errors.Is(reqCtx.TraceContext.Err(), context.DeadlineExceeded)) ||
+			(reqCtx != nil && reqCtx.Context != nil && errors.Is(reqCtx.Context.Err(), context.DeadlineExceeded))
+
+		isCanceled := errors.Is(err, context.Canceled) ||
+			(ctx != nil && errors.Is(ctx.Err(), context.Canceled)) ||
+			(reqCtx != nil && reqCtx.TraceContext != nil && errors.Is(reqCtx.TraceContext.Err(), context.Canceled)) ||
+			(reqCtx != nil && reqCtx.Context != nil && errors.Is(reqCtx.Context.Err(), context.Canceled)) ||
+			(plan != nil && plan.QuorumOutcome != nil && plan.QuorumOutcome.Disposition == looper.FusionQuorumCancelled)
+
+		if isDeadlineExceeded {
+			// Deadline exceeded
+		} else if isCanceled {
+			if plan != nil && plan.QuorumOutcome != nil {
+				plan.QuorumOutcome.Disposition = looper.FusionQuorumCancelled
+			}
+		} else if errors.Is(err, budget.ErrExhausted) {
+			if plan != nil && plan.QuorumOutcome != nil {
+				plan.QuorumOutcome.Disposition = looper.FusionQuorumBudgetExhausted
+			}
+		}
+		if plan != nil {
+			finalizeLooperQuorumOutcome(reqCtx, plan.QuorumOutcome, decision, false)
+		}
 		statusCode := 502
 		lifecycleState := routerreplay.LifecycleFailed
 		reason := "looper_stream_dispatch_encode_failed"
@@ -432,31 +469,28 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 		var maskingErr *maskingDispatchError
 		var budgetErr *selection.RequestBudgetError
 		var windowErr *looper.StageContextWindowError
-		if errors.As(err, &maskingErr) {
-			statusCode = http.StatusServiceUnavailable // 503
-			reason = "looper_stream_dispatch_masking_unavailable"
-			msg = maskingUnavailableMessage
-		} else if errors.Is(err, context.DeadlineExceeded) {
+		if isDeadlineExceeded {
 			statusCode = 504
 			reason = "looper_stream_dispatch_deadline_exceeded"
 			msg = "Looper streaming dispatch deadline exceeded"
 			if reqCtx != nil {
-				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorUpstreamTimeout, "request_timeout", "request timed out", err)
+				cause := err
+				if !errors.Is(cause, context.DeadlineExceeded) {
+					cause = context.DeadlineExceeded
+				}
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorUpstreamTimeout, "request_timeout", "request timed out", cause)
 			}
-		} else if errors.Is(err, context.Canceled) {
+		} else if isCanceled {
 			statusCode = 500
 			lifecycleState = routerreplay.LifecycleAborted
 			reason = "client_cancelled_during_looper_dispatch"
 			msg = "Client cancelled during looper dispatch"
 			if reqCtx != nil {
-				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInternal, "request_canceled", "request canceled", err)
-			}
-		} else if errors.As(err, &windowErr) {
-			statusCode = 400
-			reason = "looper_stage_context_exceeded"
-			msg = "Looper stage context window exceeded"
-			if reqCtx != nil {
-				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInvalidRequest, "context_length_exceeded", "Looper stage context window exceeded", err)
+				cause := err
+				if !errors.Is(cause, context.Canceled) {
+					cause = context.Canceled
+				}
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInternal, "request_canceled", "request canceled", cause)
 			}
 		} else if errors.Is(err, budget.ErrExhausted) {
 			statusCode = 400
@@ -464,6 +498,17 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 			msg = "Looper budget exhausted"
 			if reqCtx != nil {
 				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInvalidRequest, "budget_exhausted", "Looper budget exhausted", err)
+			}
+		} else if errors.As(err, &maskingErr) {
+			statusCode = http.StatusServiceUnavailable // 503
+			reason = "looper_stream_dispatch_masking_unavailable"
+			msg = maskingUnavailableMessage
+		} else if errors.As(err, &windowErr) {
+			statusCode = 400
+			reason = "looper_stage_context_exceeded"
+			msg = "Looper stage context window exceeded"
+			if reqCtx != nil {
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInvalidRequest, "context_length_exceeded", "Looper stage context window exceeded", err)
 			}
 		} else if errors.As(err, &budgetErr) {
 			statusCode = 400
@@ -505,6 +550,46 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 		return dispatchResponse, nil
 	}
 
+	currentLedger, ok := budget.Current(ctx)
+	if !ok && reqCtx != nil && reqCtx.TraceContext != nil {
+		currentLedger, ok = budget.Current(reqCtx.TraceContext)
+	}
+	if ok && currentLedger != nil && currentLedger.Remaining() < 1 {
+		if plan != nil && plan.QuorumOutcome != nil {
+			plan.QuorumOutcome.Disposition = looper.FusionQuorumBudgetExhausted
+		}
+		if plan != nil {
+			finalizeLooperQuorumOutcome(reqCtx, plan.QuorumOutcome, decision, false)
+		}
+		if reqCtx != nil {
+			reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInvalidRequest, "budget_exhausted", "Looper budget exhausted", budget.ErrExhausted)
+		}
+		observed := currentLedger.Used()
+		algorithm := ""
+		if decision != nil && decision.Algorithm != nil {
+			algorithm = decision.Algorithm.Type
+		}
+		logging.ComponentErrorEvent("extproc", "looper_call_budget_exhausted", map[string]interface{}{
+			"request_id": reqCtx.RequestID,
+			"decision":   decision.Name,
+			"algorithm":  algorithm,
+			"limit":      limit,
+			"hops":       observed,
+			"calls":      observed,
+		})
+		return r.recordLooperFailureWithLifecycle(
+			reqCtx, originalModel, decision, 400,
+			"Looper budget exhausted", routerreplay.LifecycleFailed, "looper_budget_exhausted",
+			looperFailureEvidence{
+				algorithm:    algorithm,
+				modelsUsed:   plan.ModelsUsed,
+				iterations:   plan.Iterations,
+				usage:        plan.IntermediateUsage,
+				fusionQuorum: plan.QuorumOutcome,
+			},
+		), nil
+	}
+
 	success = true
 	// Update RequestContext state for subsequent response stream handling and audit
 	reqCtx.LooperTargetModel = targetModel
@@ -513,7 +598,9 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 		reqCtx.LooperSynthesisPromptTokens = max(1, (synthesisTextBytes+3)/4)
 	}
 	reqCtx.LooperIntermediateUsage = plan.IntermediateUsage
-	if ledger != nil {
+	if ok && currentLedger != nil {
+		reqCtx.LooperRemainingBudget = currentLedger.Remaining()
+	} else if ledger != nil {
 		reqCtx.LooperRemainingBudget = ledger.Remaining()
 	}
 	reqCtx.LooperTrace = plan.Trace
@@ -572,13 +659,39 @@ func looperSynthesisSamplingTextBytes(reqCtx *RequestContext, fallback *llmproto
 }
 
 func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
+	ctx context.Context,
 	rawSynthesisBody []byte,
 	targetModel string,
 	decision *config.Decision,
 	reqCtx *RequestContext,
 ) (*ext_proc.ProcessingResponse, int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if reqCtx != nil {
+		if ledger, ok := budget.Current(ctx); ok && ledger != nil {
+			if reqCtx.TraceContext != nil {
+				reqCtx.TraceContext = budget.WithLedger(reqCtx.TraceContext, ledger)
+			} else {
+				reqCtx.TraceContext = ctx
+			}
+			if reqCtx.Context != nil {
+				reqCtx.Context = budget.WithLedger(reqCtx.Context, ledger)
+			}
+		} else if reqCtx.TraceContext != nil {
+			if ledger, ok := budget.Current(reqCtx.TraceContext); ok && ledger != nil {
+				ctx = budget.WithLedger(ctx, ledger)
+			}
+		}
+	}
+	if ctx.Err() != nil {
+		return nil, 0, ctx.Err()
+	}
 	if reqCtx != nil && reqCtx.TraceContext != nil && reqCtx.TraceContext.Err() != nil {
 		return nil, 0, reqCtx.TraceContext.Err()
+	}
+	if reqCtx != nil && reqCtx.Context != nil && reqCtx.Context.Err() != nil {
+		return nil, 0, reqCtx.Context.Err()
 	}
 
 	if reqCtx != nil {

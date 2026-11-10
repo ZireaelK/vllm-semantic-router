@@ -16,6 +16,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/looper"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
 )
 
 func (r *OpenAIRouter) handleNonStreamingResponseBody(
@@ -38,12 +39,13 @@ func (r *OpenAIRouter) handleNonStreamingResponseBody(
 			decodeEvent["cause"] = cause.Error()
 		}
 		logging.ComponentErrorEvent("extproc", "neutral_response_decode_failed", decodeEvent)
-		if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
-			ctx.PendingLooperQuorumOutcome.Disposition = looper.FusionQuorumResponseEncodeFailed
-			finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
-			ctx.PendingLooperQuorumOutcome = nil
-		}
-		return r.createErrorResponse(502, "The selected model returned an invalid response")
+		return r.handleNonStreamingResponseError(
+			ctx,
+			err,
+			502,
+			"The selected model returned an invalid response",
+			"response_decode_failed",
+		)
 	}
 	decodedDiagnosticsEnd := len(ctx.ProtocolDiagnostics)
 	clientBody := responseBody
@@ -61,11 +63,13 @@ func (r *OpenAIRouter) handleNonStreamingResponseBody(
 	if rewriteClientBody {
 		clientBody, err = r.encodeClientResponse(*semanticResponse, ctx)
 		if err != nil {
-			if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
-				finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
-				ctx.PendingLooperQuorumOutcome = nil
-			}
-			return r.createErrorResponse(502, "The selected model returned an incompatible response")
+			return r.handleNonStreamingResponseError(
+				ctx,
+				err,
+				502,
+				"The selected model returned an incompatible response",
+				"response_encode_failed",
+			)
 		}
 		ctx.ProtocolDiagnostics = deduplicateReencodedResponseDiagnostics(
 			ctx.ProtocolDiagnostics, diagnosticsBeforeBody, decodedDiagnosticsEnd,
@@ -108,21 +112,26 @@ func (r *OpenAIRouter) handleNonStreamingResponseBody(
 		r.updateResponseCache(ctx, r.cacheableClientResponse(clientBody, rewriteClientBody, *semanticResponse, ctx))
 	}
 
-	blocked, finalBody, headerOptions := r.finalizeResponsePolicy(ctx, semanticResponse, clientBody)
-	lateWarning, hasLateDiagnostics := recordBufferedProtocolDiagnostics(ctx, diagnosticsBeforeBody)
-	if blocked != nil {
+	plan := r.prepareResponsePolicy(ctx, semanticResponse, clientBody)
+	if plan.blocked != nil {
 		if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
 			ctx.PendingLooperQuorumOutcome.Disposition = looper.FusionQuorumResponseEncodeFailed
 			finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
 			ctx.PendingLooperQuorumOutcome = nil
 		}
-		return blocked
+		plan.commit()
+		return plan.blocked
 	}
 
 	if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
 		finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, true)
 		ctx.PendingLooperQuorumOutcome = nil
 	}
+	plan.commit()
+
+	finalBody := plan.finalBody
+	headerOptions := plan.headerOptions()
+	lateWarning, hasLateDiagnostics := recordBufferedProtocolDiagnostics(ctx, diagnosticsBeforeBody)
 
 	response := buildResponseBodyContinueResponse(nil, nil)
 	if len(headerOptions) > 0 {
@@ -510,4 +519,84 @@ func (r *OpenAIRouter) cacheableClientResponse(
 		return nil
 	}
 	return canonical
+}
+
+func (r *OpenAIRouter) handleNonStreamingResponseError(
+	ctx *RequestContext,
+	err error,
+	statusCode int,
+	clientMessage string,
+	terminalReason string,
+) *ext_proc.ProcessingResponse {
+	if ctx != nil && ctx.RouterReplayID == "" {
+		model := firstNonEmpty(ctx.RequestModel, ctx.LooperTargetModel, ctx.VSRSelectedModel)
+		target := firstNonEmpty(ctx.LooperTargetModel, ctx.VSRSelectedModel)
+		decisionName := ctx.VSRSelectedDecisionName
+		if decisionName == "" && ctx.VSRSelectedDecision != nil {
+			decisionName = ctx.VSRSelectedDecision.Name
+		}
+		r.startRouterReplay(ctx, model, target, decisionName)
+	}
+	if ctx != nil {
+		if ctx.SemanticStreamState == nil {
+			ctx.SemanticStreamState = &semanticResponseStreamState{}
+		}
+		if ctx.SemanticStreamState.failed == nil {
+			var protoErr *llmprotocol.ProtocolError
+			if errors.As(err, &protoErr) {
+				ctx.SemanticStreamState.failed = protoErr
+			} else {
+				ctx.SemanticStreamState.failed = llmprotocol.NewError(
+					llmprotocol.ErrorInternal,
+					terminalReason,
+					err.Error(),
+					err,
+				)
+			}
+		}
+		ctx.SemanticStreamState.terminal = true
+	}
+	if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
+		ctx.PendingLooperQuorumOutcome.Disposition = looper.FusionQuorumResponseEncodeFailed
+		finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
+		ctx.PendingLooperQuorumOutcome = nil
+	}
+	if ctx != nil && (ctx.LooperStreamingActive || ctx.LooperIntermediateUsage.TotalTokens > 0) && !ctx.LooperUsageSettled {
+		r.settleAbortedLooperStreamingUsage(ctx, err)
+	}
+	errResp := r.createErrorResponse(statusCode, clientMessage)
+	r.attachRouterReplayImmediateResponse(ctx, errResp, routerreplay.LifecycleFailed, terminalReason)
+	return errResp
+}
+
+func (r *OpenAIRouter) attachRouterReplayImmediateResponse(
+	ctx *RequestContext,
+	response *ext_proc.ProcessingResponse,
+	lifecycleState string,
+	reason string,
+) {
+	if r == nil || ctx == nil || response == nil {
+		return
+	}
+	if ctx.RouterReplayID == "" {
+		model := firstNonEmpty(ctx.RequestModel, ctx.LooperTargetModel, ctx.VSRSelectedModel)
+		target := firstNonEmpty(ctx.LooperTargetModel, ctx.VSRSelectedModel)
+		decisionName := ctx.VSRSelectedDecisionName
+		if decisionName == "" && ctx.VSRSelectedDecision != nil {
+			decisionName = ctx.VSRSelectedDecision.Name
+		}
+		r.startRouterReplay(ctx, model, target, decisionName)
+	}
+	immediate := response.GetImmediateResponse()
+	if immediate == nil {
+		return
+	}
+	statusCode := int(immediate.GetStatus().GetCode())
+	if statusCode == 0 {
+		statusCode = 502
+	}
+	r.updateRouterReplayStatus(ctx, statusCode, false)
+	r.attachRouterReplayResponse(ctx, immediate.Body, false)
+	r.finalizeRouterReplay(ctx, lifecycleState, reason)
+	addRouterReplayHeaderToImmediateResponse(response, ctx.RouterReplayID)
 }

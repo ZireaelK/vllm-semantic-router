@@ -464,8 +464,13 @@ func (r *OpenAIRouter) finalizeRouterReplay(
 	state string,
 	reason string,
 ) {
-	if ctx == nil || ctx.RouterReplayID == "" {
+	if ctx == nil || ctx.RouterReplayID == "" || ctx.RouterReplayCommitted {
 		return
+	}
+
+	if ctx.TerminalLifecycleState == "" {
+		ctx.TerminalLifecycleState = state
+		ctx.TerminalLifecycleReason = reason
 	}
 
 	recorder := ctx.RouterReplayRecorder
@@ -476,14 +481,17 @@ func (r *OpenAIRouter) finalizeRouterReplay(
 		return
 	}
 
-	if err := recorder.FinalizeLifecycle(ctx.RouterReplayID, state, reason); err != nil {
+	if err := recorder.FinalizeLifecycle(ctx.RouterReplayID, ctx.TerminalLifecycleState, ctx.TerminalLifecycleReason); err != nil {
 		logging.ComponentErrorEvent("extproc", "router_replay_lifecycle_update_failed", map[string]interface{}{
 			"request_id": ctx.RequestID,
 			"replay_id":  ctx.RouterReplayID,
-			"state":      state,
+			"state":      ctx.TerminalLifecycleState,
+			"reason":     ctx.TerminalLifecycleReason,
 			"error":      err.Error(),
 		})
+		return
 	}
+	ctx.RouterReplayCommitted = true
 }
 
 // attachRouterReplayResponse stores response payload (if configured) and optionally logs completion.

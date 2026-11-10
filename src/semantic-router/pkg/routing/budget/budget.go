@@ -32,6 +32,17 @@ func WithLimit(ctx context.Context, limit int) (context.Context, *Ledger) {
 	return context.WithValue(ctx, contextKey{}, ledger), ledger
 }
 
+// WithLedger attaches an existing ledger to a context. If ledger is nil, ctx is returned unchanged.
+func WithLedger(ctx context.Context, ledger *Ledger) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ledger == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, contextKey{}, ledger)
+}
+
 // Consume reserves one exchange immediately before transport. A reservation is
 // not refunded on errors: failures and retries use the same request budget.
 func Consume(ctx context.Context) error {
@@ -55,6 +66,9 @@ func Consume(ctx context.Context) error {
 
 // Current returns the request ledger carried by ctx, when one is installed.
 func Current(ctx context.Context) (*Ledger, bool) {
+	if ctx == nil {
+		return nil, false
+	}
 	ledger, ok := ctx.Value(contextKey{}).(*Ledger)
 	return ledger, ok
 }

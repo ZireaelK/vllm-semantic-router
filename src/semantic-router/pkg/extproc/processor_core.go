@@ -227,6 +227,9 @@ func isLooperCancellation(ctx *RequestContext, err error) bool {
 		if strings.Contains(errStr, "semantic stream failed:") && !strings.Contains(errStr, "stream_canceled") {
 			return false
 		}
+		if strings.Contains(errStr, "upstream") {
+			return false
+		}
 	}
 
 	if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
@@ -340,12 +343,16 @@ func (r *OpenAIRouter) settleAbortedLooperStreamingUsage(ctx *RequestContext, er
 		abortStage = "upstream_prefill"
 	}
 	abortReason := "upstream_response_failed"
-	if ctx != nil && ctx.SemanticStreamState != nil && ctx.SemanticStreamState.failed != nil && ctx.SemanticStreamState.failed.Code != "stream_canceled" {
+	if ctx != nil && ctx.UpstreamStatusCode >= 400 {
+		abortReason = "upstream_error_response"
+	} else if ctx != nil && ctx.SemanticStreamState != nil && ctx.SemanticStreamState.failed != nil && ctx.SemanticStreamState.failed.Code != "stream_canceled" {
 		abortReason = "upstream_error_response"
 	} else if isLooperCancellation(ctx, err) {
 		abortReason = "client_canceled"
-	} else if ctx.UpstreamStatusCode < 400 {
-		_, abortReason = replayLifecycleForReceiveError(err)
+	} else if errors.Is(err, io.EOF) {
+		abortReason = "stream_ended_before_terminal_response"
+	} else if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
+		abortReason = "deadline_exceeded"
 	}
 	completionLatency := time.Duration(0)
 	if !ctx.StartTime.IsZero() {
@@ -419,6 +426,9 @@ func resolveReplayLifecycleState(ctx *RequestContext, err error, defaultState, d
 	}
 	if isLooperCancellation(ctx, err) {
 		return routerreplay.LifecycleAborted, "client_canceled"
+	}
+	if defaultState == routerreplay.LifecycleFailed && defaultReason == "extproc_receive_failed" {
+		return routerreplay.LifecycleFailed, "upstream_response_failed"
 	}
 	return defaultState, defaultReason
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -758,7 +759,7 @@ func TestBuildLooperStreamingDispatchResponse_PreservesClientSemanticRequestCont
 	}
 
 	synthesisBody := []byte(`{"model":"judge","messages":[{"role":"system","content":"synthesis prompt"}]}`)
-	_, _, _ = router.buildLooperStreamingDispatchResponse(synthesisBody, "judge", decision, reqCtx)
+	_, _, _ = router.buildLooperStreamingDispatchResponse(context.Background(), synthesisBody, "judge", decision, reqCtx)
 
 	require.Same(t, originalSemanticReq, reqCtx.SemanticRequest, "reqCtx.SemanticRequest must be restored to client's original request")
 	require.Equal(t, originalEnvelope, reqCtx.ProtocolEnvelope, "reqCtx.ProtocolEnvelope must be restored to client's original envelope")
@@ -779,7 +780,7 @@ func TestBuildLooperStreamingDispatchResponse_ContextCancelledReturnsError(t *te
 	decision := &config.Decision{Name: "test-decision"}
 	synthesisBody := []byte(`{"model":"judge","messages":[{"role":"system","content":"synthesis prompt"}]}`)
 
-	resp, n, err := router.buildLooperStreamingDispatchResponse(synthesisBody, "judge", decision, reqCtx)
+	resp, n, err := router.buildLooperStreamingDispatchResponse(ctx, synthesisBody, "judge", decision, reqCtx)
 	require.ErrorIs(t, err, context.Canceled)
 	require.Nil(t, resp)
 	require.Equal(t, 0, n)
@@ -1983,7 +1984,7 @@ func TestLooperStreamingDispatch_BuildResponseDoesNotMutateClientRequest(t *test
 	}
 
 	rawSynthesis := []byte(`{"model":"synth-model","messages":[{"role":"user","content":"hi"}],"max_tokens":500}`)
-	resp, _, err := router.buildLooperStreamingDispatchResponse(rawSynthesis, "synth-model", decision, reqCtx)
+	resp, _, err := router.buildLooperStreamingDispatchResponse(context.Background(), rawSynthesis, "synth-model", decision, reqCtx)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 
@@ -2380,7 +2381,7 @@ func TestLooperStreamingAbort_CompressedLargeRequestSettlesPostCompressionPrompt
 
 	// Call buildLooperStreamingDispatchResponse
 	resp, synthesisTextBytes, err := router.buildLooperStreamingDispatchResponse(
-		rawSynthesisBody, model, decision, reqCtx,
+		context.Background(), rawSynthesisBody, model, decision, reqCtx,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
@@ -2514,7 +2515,7 @@ func TestLooperStreaming_SynthesisTextBytesReflectsPostCompression(t *testing.T)
 
 	// Call buildLooperStreamingDispatchResponse
 	resp, synthesisTextBytes, err := router.buildLooperStreamingDispatchResponse(
-		rawSynthesisBody, model, decision, reqCtx,
+		context.Background(), rawSynthesisBody, model, decision, reqCtx,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
@@ -3268,6 +3269,39 @@ func TestLooperStreaming_ProcessRealEntrypointPanicSettlesIntermediateTokens(t *
 	})
 }
 
+type looperQuorumOrderingStore struct {
+	store.Storage
+	mu                sync.Mutex
+	calls             []string
+	quorumAtCompleted *store.FusionQuorumDiagnostics
+}
+
+func (s *looperQuorumOrderingStore) UpdateLifecycle(ctx context.Context, id string, state string, endedAt time.Time, durationMS int64, reason string) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, "UpdateLifecycle:"+state)
+	if state == store.LifecycleCompleted {
+		if rec, ok, _ := s.Storage.Get(ctx, id); ok && rec.RouteDiagnostics != nil && rec.RouteDiagnostics.FusionQuorum != nil {
+			cloned := *rec.RouteDiagnostics.FusionQuorum
+			s.quorumAtCompleted = &cloned
+		}
+	}
+	s.mu.Unlock()
+	return s.Storage.UpdateLifecycle(ctx, id, state, endedAt, durationMS, reason)
+}
+
+func (s *looperQuorumOrderingStore) UpdateFusionQuorum(ctx context.Context, id string, quorum store.FusionQuorumDiagnostics) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, "UpdateFusionQuorum")
+	s.mu.Unlock()
+	return s.Storage.UpdateFusionQuorum(ctx, id, quorum)
+}
+
+func (s *looperQuorumOrderingStore) snapshotCalls() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.calls...)
+}
+
 func TestLooperStreaming_QuorumFallbackResponsePhaseFinalization(t *testing.T) {
 	newQuorumFallbackFixture := func(t *testing.T) (*httptest.Server, *OpenAIRouter, *RequestContext, *config.Decision) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3555,6 +3589,105 @@ func TestLooperStreaming_QuorumFallbackResponsePhaseFinalization(t *testing.T) {
 		require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on 200 completion")
 		require.Equal(t, string(looper.FusionQuorumFallbackServed), reqCtx.VSRFusionQuorum.Disposition,
 			"200 non-streaming completion must finalize to fallback_served")
+
+		require.NotEmpty(t, reqCtx.RouterReplayID)
+		record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleCompleted, record.LifecycleState)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, string(looper.FusionQuorumFallbackServed), record.RouteDiagnostics.FusionQuorum.Disposition)
+	})
+
+	t.Run("non-streaming JSON 200 response commits quorum diagnostics before publishing completed lifecycle", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer server.Close()
+
+		router, reqCtx, request := quorumFallbackRouter(server.URL)
+		obsStore := &looperQuorumOrderingStore{
+			Storage: store.NewMemoryStore(10, 0),
+		}
+		recorder := routerreplay.NewRecorder(obsStore)
+		router.ReplayRecorder = recorder
+		router.Config.ClearRouteCache = true
+		reqCtx.ExpectStreamingResponse = true
+		request.Stream = true
+
+		decision := &config.Decision{
+			Name: "fusion-quorum-fallback-delayed",
+			Algorithm: &config.AlgorithmConfig{
+				Type: config.DecisionAlgorithmFusion,
+				Fusion: &config.FusionAlgorithmConfig{
+					Model:                "judge",
+					AnalysisModels:       []string{"panel-a", "panel-b"},
+					AnalysisMode:         config.FusionAnalysisModeOneCall,
+					QuorumFailurePolicy:  config.FusionQuorumFailurePolicyFallback,
+					QuorumFallbackTarget: "backup-model",
+				},
+			},
+		}
+
+		response, err := router.handleLooperExecution(context.Background(), request, decision, reqCtx)
+		require.NoError(t, err)
+		require.NotNil(t, response)
+		require.Nil(t, response.GetImmediateResponse())
+		require.True(t, reqCtx.LooperStreamingActive)
+		require.NotEmpty(t, reqCtx.RouterReplayID)
+
+		body := []byte(`{
+			"id": "chatcmpl-fallback-200",
+			"object": "chat.completion",
+			"created": 1234567890,
+			"model": "backup-model",
+			"choices": [{
+				"index": 0,
+				"message": {"role": "assistant", "content": "non-streaming fallback answer"},
+				"finish_reason": "stop"
+			}],
+			"usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
+		}`)
+
+		resp := router.handleNonStreamingResponseBody(body, reqCtx, 100*time.Millisecond)
+		require.NotNil(t, resp)
+		require.Nil(t, resp.GetImmediateResponse(), "valid 200 body must continue without immediate error")
+
+		require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after non-streaming completion")
+		require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on 200 completion")
+
+		// Assert ordering: UpdateFusionQuorum must occur before UpdateLifecycle:completed
+		calls := obsStore.snapshotCalls()
+		require.Contains(t, calls, "UpdateFusionQuorum")
+		require.Contains(t, calls, "UpdateLifecycle:completed")
+
+		var quorumIdx, lifecycleIdx int = -1, -1
+		for idx, call := range calls {
+			if call == "UpdateFusionQuorum" && quorumIdx == -1 {
+				quorumIdx = idx
+			}
+			if call == "UpdateLifecycle:completed" && lifecycleIdx == -1 {
+				lifecycleIdx = idx
+			}
+		}
+		require.True(t, quorumIdx >= 0 && lifecycleIdx >= 0, "both UpdateFusionQuorum and UpdateLifecycle:completed must be called")
+		require.Less(t, quorumIdx, lifecycleIdx, "UpdateFusionQuorum must be executed BEFORE UpdateLifecycle:completed to eliminate window where completed record lacks quorum")
+
+		// Assert that at the exact moment LifecycleCompleted was committed to store, FusionQuorum was already present
+		require.NotNil(t, obsStore.quorumAtCompleted, "Replay record must already have FusionQuorum diagnostics when transitioning to Completed")
+		require.Equal(t, string(looper.FusionQuorumFallbackServed), obsStore.quorumAtCompleted.Disposition)
+		require.Equal(t, 2, obsStore.quorumAtCompleted.RequiredCount)
+		require.Equal(t, 0, obsStore.quorumAtCompleted.UsableCount)
+		require.Equal(t, "backup-model", obsStore.quorumAtCompleted.FallbackTarget)
+
+		// Also assert the final persisted record in store
+		record, ok, err := obsStore.Get(context.Background(), reqCtx.RouterReplayID)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleCompleted, record.LifecycleState)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, string(looper.FusionQuorumFallbackServed), record.RouteDiagnostics.FusionQuorum.Disposition)
 	})
 
 	t.Run("non-streaming decode error finalizes to response_encode_failed instead of fallback_served", func(t *testing.T) {

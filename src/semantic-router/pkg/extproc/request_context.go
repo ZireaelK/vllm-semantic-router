@@ -21,6 +21,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/ratelimit"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing/budget"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/selection"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/selectiontrace"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/sessiontelemetry"
@@ -414,6 +415,9 @@ type RequestContext struct {
 	RouterReplayID           string                           // ID of the router replay session, if applicable
 	RouterReplayPluginConfig *config.RouterReplayPluginConfig // Per-decision plugin configuration for router replay
 	RouterReplayRecorder     *routerreplay.Recorder           // The recorder instance for this decision
+	RouterReplayCommitted    bool                             // True once a terminal lifecycle state is committed
+	TerminalLifecycleState   string                           // Initial selected terminal state (e.g. LifecycleCompleted, LifecycleFailed)
+	TerminalLifecycleReason  string                           // Initial selected terminal reason (e.g. response_decode_failed, stream_completed)
 	// RouterReplayContentOmitted records prompt omission. Response/tool capture
 	// separately checks stage-specific evidence and the resolved capture policy.
 	RouterReplayContentOmitted bool
@@ -548,6 +552,13 @@ func (ctx *RequestContext) embeddingContext() context.Context {
 		return context.Background()
 	}
 	if ctx.TraceContext != nil {
+		if ctx.Context != nil {
+			if ledger, ok := budget.Current(ctx.Context); ok {
+				if _, has := budget.Current(ctx.TraceContext); !has {
+					return budget.WithLedger(ctx.TraceContext, ledger)
+				}
+			}
+		}
 		return ctx.TraceContext
 	}
 	if ctx.Context != nil {

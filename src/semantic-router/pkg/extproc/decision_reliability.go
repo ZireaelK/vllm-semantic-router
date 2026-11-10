@@ -69,8 +69,40 @@ func configuredRetriesFromDecisionOrModel(r *OpenAIRouter, ctx *RequestContext, 
 	if override != nil && override.RetryCount != nil {
 		return max(0, *override.RetryCount)
 	}
+
+	modelCfg, found := lookupModelParams(r, ctx, route)
+
+	hasRetryConditions := override != nil && (len(override.RetryOn) > 0 ||
+		len(override.RetriableStatusCodes) > 0 ||
+		override.RetryBackOffBase != nil ||
+		override.RetryBackOffMax != nil ||
+		override.RetryAfterMax != nil)
+
+	if hasRetryConditions {
+		if found {
+			if modelCfg.Reliability.RetryCount > 0 {
+				return modelCfg.Reliability.RetryCount
+			}
+			// If provider only configured per_try_timeout and has explicit zero-retries base policy,
+			// keep it as 0.
+			if strings.TrimSpace(modelCfg.Reliability.PerTryTimeout) != "" {
+				return 0
+			}
+		}
+		// According to system merge rules (upstream/policy.go:122), when conditions appear alone
+		// without a base retry policy, baseline effective retries is 1.
+		return 1
+	}
+
+	if found {
+		return max(0, modelCfg.Reliability.RetryCount)
+	}
+	return 0
+}
+
+func lookupModelParams(r *OpenAIRouter, ctx *RequestContext, route string) (config.ModelParams, bool) {
 	if r == nil || r.Config == nil {
-		return 0
+		return config.ModelParams{}, false
 	}
 	target := route
 	if target == "" && ctx != nil {
@@ -82,7 +114,7 @@ func configuredRetriesFromDecisionOrModel(r *OpenAIRouter, ctx *RequestContext, 
 	}
 	if target != "" {
 		if modelCfg, ok := r.Config.ModelConfig[target]; ok {
-			return max(0, modelCfg.Reliability.RetryCount)
+			return modelCfg, true
 		}
 	}
 	if ctx != nil && ctx.LooperStreamingActive {
@@ -91,21 +123,21 @@ func configuredRetriesFromDecisionOrModel(r *OpenAIRouter, ctx *RequestContext, 
 		// to 0 and must never fall back to unrelated models (e.g. from client header or prior turns).
 		if ctx.LooperTargetModel != "" && ctx.LooperTargetModel != target {
 			if modelCfg, ok := r.Config.ModelConfig[ctx.LooperTargetModel]; ok {
-				return max(0, modelCfg.Reliability.RetryCount)
+				return modelCfg, true
 			}
 		}
-		return 0
+		return config.ModelParams{}, false
 	}
 	if ctx != nil && ctx.LooperTargetModel != "" {
 		if modelCfg, ok := r.Config.ModelConfig[ctx.LooperTargetModel]; ok {
-			return max(0, modelCfg.Reliability.RetryCount)
+			return modelCfg, true
 		}
 	} else if ctx != nil && ctx.VSRSelectedModel != "" {
 		if modelCfg, ok := r.Config.ModelConfig[ctx.VSRSelectedModel]; ok {
-			return max(0, modelCfg.Reliability.RetryCount)
+			return modelCfg, true
 		}
 	}
-	return 0
+	return config.ModelParams{}, false
 }
 
 // callReliability converts a decision's reliability block to the routing
@@ -188,8 +220,12 @@ func (r *OpenAIRouter) addEnvoyReliabilityHeaders(response *ext_proc.ProcessingR
 		return
 	}
 	route := routeKeyOf(mutation)
-	if route == "" {
-		route = ctx.backendModelForCandidate(firstNonEmpty(ctx.LooperTargetModel, ctx.VSRSelectedModel))
+	if route == "" && ctx != nil {
+		candidate := firstNonEmpty(ctx.LooperTargetModel, ctx.VSRSelectedModel, ctx.RequestModel)
+		route = ctx.backendModelForCandidate(candidate)
+		if route == "" {
+			route = candidate
+		}
 	}
 
 	configuredRetries := configuredRetriesFromDecisionOrModel(r, ctx, override, route)
