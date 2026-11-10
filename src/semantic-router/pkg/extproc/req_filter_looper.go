@@ -163,6 +163,12 @@ func (r *OpenAIRouter) shouldStreamLooperFinalStage(
 	if request == nil || !request.Stream {
 		return false
 	}
+	if request.CandidateCount != nil && *request.CandidateCount > 1 {
+		return false
+	}
+	if reqCtx.SemanticRequest != nil && reqCtx.SemanticRequest.CandidateCount != nil && *reqCtx.SemanticRequest.CandidateCount > 1 {
+		return false
+	}
 	if reqCtx.SourceFormat != llmprotocol.OpenAIChatV1 {
 		return false
 	}
@@ -379,6 +385,9 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 			reqCtx.VSRSelectionMethod = decision.Algorithm.Type
 		}
 		if decision != nil {
+			if reqCtx.VSRSelectedDecision == nil {
+				reqCtx.VSRSelectedDecision = decision
+			}
 			reqCtx.VSRSelectedDecisionName = decision.Name
 		}
 		reqCtx.LooperStreamingActive = true
@@ -573,6 +582,12 @@ func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
 	}
 
 	if reqCtx != nil {
+		if reqCtx.VSRSelectedDecision == nil && decision != nil {
+			reqCtx.VSRSelectedDecision = decision
+		}
+		if reqCtx.VSRSelectedDecisionName == "" && decision != nil {
+			reqCtx.VSRSelectedDecisionName = decision.Name
+		}
 		clientSemanticReq := reqCtx.SemanticRequest
 		clientEnvelope := reqCtx.ProtocolEnvelope
 		defer func() {
@@ -601,16 +616,20 @@ func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
 	useReasoning, reasoningEffort := r.getReasoningInfoFromDecision(decision, targetModel)
 	applyLooperReasoningContext(reqCtx, targetModel, useReasoning, reasoningEffort)
 
+	decisionName := ""
+	if decision != nil {
+		decisionName = decision.Name
+	}
+
 	backendModel := reqCtx.backendModelForCandidate(targetModel)
 	_, _, hasConfiguredBackend, _ := r.Config.ResolvePrimaryBackendForModel(backendModel)
 	if hasConfiguredBackend || r.Config.Looper.Endpoint == "" {
-		dispatch, prepErr := r.prepareProviderDispatch(&synthesisReq, targetModel, "", useReasoning, reqCtx)
+		dispatch, prepErr := r.prepareProviderDispatch(&synthesisReq, targetModel, decisionName, useReasoning, reqCtx)
 		if prepErr != nil {
 			return nil, 0, prepErr
 		}
-		// Keep decision stage controls for final provider adaptation without
-		// re-inserting the semantic system prompt onto the synthesis request.
-		dispatch.decisionName = decision.Name
+		// Keep decision stage controls for final provider adaptation.
+		dispatch.decisionName = decisionName
 		reqCtx.SemanticRequest.Stream = true
 		response := r.buildProviderDispatchResponse(dispatch, reqCtx)
 		if response.GetImmediateResponse() != nil {
@@ -635,7 +654,7 @@ func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
 		backendModel:  backendModel,
 		upstreamModel: r.Config.ResolveExternalModelID(targetModel, ""),
 		targetFormat:  targetFormat,
-		decisionName:  decision.Name,
+		decisionName:  decisionName,
 		useReasoning:  useReasoning,
 	}
 	synthesisReq.Model = dispatch.upstreamModel
@@ -647,6 +666,9 @@ func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
 		reqCtx.RequestModel = dispatch.logicalModel
 		reqCtx.VSRSelectedModel = dispatch.logicalModel
 		if reqCtx.SemanticRequest != nil {
+			if _, decisionErr := r.applyDispatchDecision(reqCtx.SemanticRequest, dispatch, reqCtx); decisionErr != nil {
+				return nil, 0, decisionErr
+			}
 			if _, paramsErr := r.applyDispatchRequestParams(reqCtx.SemanticRequest, reqCtx); paramsErr != nil {
 				return nil, 0, paramsErr
 			}

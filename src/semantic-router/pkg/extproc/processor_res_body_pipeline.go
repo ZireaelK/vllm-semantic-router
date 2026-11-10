@@ -73,13 +73,11 @@ func (r *OpenAIRouter) handleNonStreamingResponseBody(
 	}
 	usage := r.takeNeutralResponseUsage(ctx)
 	if ctx != nil && ctx.LooperStreamingActive {
-		observeUpstreamResponse(ctx, "", usage)
+		upstreamUsage := r.takeNeutralResponseUpstreamUsage(ctx)
+		observeUpstreamResponse(ctx, "", upstreamUsage)
 		synthesisPromptTokens := 0
-		if ctx.SemanticResponse != nil {
-			synthesisUsage := responseUsageFromSemanticUsage(ctx.SemanticResponse.Usage)
-			if !synthesisUsage.invalid {
-				synthesisPromptTokens = synthesisUsage.promptTokens
-			}
+		if !upstreamUsage.invalid {
+			synthesisPromptTokens = upstreamUsage.promptTokens
 		}
 		if synthesisPromptTokens > 0 {
 			r.calibrateTokenEstimatorForModel(ctx, ctx.LooperTargetModel, streamingCalibrationByteLen(ctx), synthesisPromptTokens)

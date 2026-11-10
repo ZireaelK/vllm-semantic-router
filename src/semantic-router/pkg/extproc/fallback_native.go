@@ -24,6 +24,9 @@ var _ routing.FallbackSession = (*routingSession)(nil)
 // sends the calls it prepares. From here on the response phases do not fall
 // back, so the request keeps one fallback authority.
 func (s *routingSession) Fallback() routing.Fallback {
+	if s.ctx == nil || s.ctx.LooperStreamingActive || s.ctx.LooperRequest {
+		return nil
+	}
 	s.ctx.fallbackExecutedByCaller = true
 	if s.fallback == nil {
 		s.fallback = &sessionFallback{session: s}
@@ -188,6 +191,9 @@ func (f *sessionFallback) end() routing.FallbackStep {
 // the chain: a response that reaches the caller has not been committed. A
 // request-graph hop follows its resolved policy too.
 func nativeFallbackApplies(orch *fallback.Orchestrator, ctx *RequestContext) bool {
+	if ctx == nil || ctx.LooperStreamingActive || ctx.LooperRequest {
+		return false
+	}
 	return orch != nil && orch.Policy().Enabled && ctx.SemanticRequest != nil &&
 		len(ctx.VSREligibleModelRefs) > 1
 }

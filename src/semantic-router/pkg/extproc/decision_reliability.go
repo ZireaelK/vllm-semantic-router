@@ -16,9 +16,96 @@ import (
 var _ routing.ReliabilitySession = (*routingSession)(nil)
 
 // Reliability is the planned call's override: the matched decision's
-// reliability block.
+// reliability block, bounded by the remaining physical call budget during
+// looper streaming.
 func (s *routingSession) Reliability() *routing.Reliability {
-	return callReliability(s.ctx.VSRSelectedDecision)
+	if s == nil || s.ctx == nil {
+		return nil
+	}
+	override := callReliability(s.ctx.VSRSelectedDecision)
+	if !s.ctx.LooperStreamingActive {
+		return override
+	}
+
+	route := s.targetRoute()
+	configuredRetries := configuredRetriesFromDecisionOrModel(s.router, s.ctx, override, route)
+	maxAllowedRetries := max(0, s.ctx.LooperRemainingBudget-1)
+	effectiveRetries := min(configuredRetries, maxAllowedRetries)
+
+	out := override
+	if out == nil {
+		out = &routing.Reliability{}
+	}
+	out.RetryCount = &effectiveRetries
+	return out
+}
+
+func (s *routingSession) targetRoute() string {
+	if s == nil {
+		return ""
+	}
+	if s.ctx != nil && s.ctx.LooperStreamingActive {
+		candidate := firstNonEmpty(s.ctx.LooperTargetModel, s.ctx.VSRSelectedModel, s.ctx.RequestModel)
+		route := s.ctx.backendModelForCandidate(candidate)
+		if route != "" {
+			return route
+		}
+		return candidate
+	}
+	var route string
+	if s.clientHeader != nil {
+		route = s.clientHeader.Get(routing.RouteHeader)
+	}
+	if route == "" && s.ctx != nil {
+		candidate := firstNonEmpty(s.ctx.LooperTargetModel, s.ctx.VSRSelectedModel, s.ctx.RequestModel)
+		route = s.ctx.backendModelForCandidate(candidate)
+	}
+	return route
+}
+
+// configuredRetriesFromDecisionOrModel determines the configured retry count
+// prioritizing decision reliability overrides, then falling back to backend model config.
+func configuredRetriesFromDecisionOrModel(r *OpenAIRouter, ctx *RequestContext, override *routing.Reliability, route string) int {
+	if override != nil && override.RetryCount != nil {
+		return max(0, *override.RetryCount)
+	}
+	if r == nil || r.Config == nil {
+		return 0
+	}
+	target := route
+	if target == "" && ctx != nil {
+		candidate := firstNonEmpty(ctx.LooperTargetModel, ctx.VSRSelectedModel, ctx.RequestModel)
+		target = ctx.backendModelForCandidate(candidate)
+		if target == "" {
+			target = candidate
+		}
+	}
+	if target != "" {
+		if modelCfg, ok := r.Config.ModelConfig[target]; ok {
+			return max(0, modelCfg.Reliability.RetryCount)
+		}
+	}
+	if ctx != nil && ctx.LooperStreamingActive {
+		// During looper streaming, targetRoute already resolved the target model candidate.
+		// If route or LooperTargetModel is not configured in ModelConfig, retries default
+		// to 0 and must never fall back to unrelated models (e.g. from client header or prior turns).
+		if ctx.LooperTargetModel != "" && ctx.LooperTargetModel != target {
+			if modelCfg, ok := r.Config.ModelConfig[ctx.LooperTargetModel]; ok {
+				return max(0, modelCfg.Reliability.RetryCount)
+			}
+		}
+		return 0
+	}
+	if ctx != nil && ctx.LooperTargetModel != "" {
+		if modelCfg, ok := r.Config.ModelConfig[ctx.LooperTargetModel]; ok {
+			return max(0, modelCfg.Reliability.RetryCount)
+		}
+	} else if ctx != nil && ctx.VSRSelectedModel != "" {
+		if modelCfg, ok := r.Config.ModelConfig[ctx.VSRSelectedModel]; ok {
+			return max(0, modelCfg.Reliability.RetryCount)
+		}
+	}
+	return 0
 }
 
 // callReliability converts a decision's reliability block to the routing
@@ -102,18 +189,10 @@ func (r *OpenAIRouter) addEnvoyReliabilityHeaders(response *ext_proc.ProcessingR
 	}
 	route := routeKeyOf(mutation)
 	if route == "" {
-		route = ctx.backendModelForCandidate(ctx.VSRSelectedModel)
+		route = ctx.backendModelForCandidate(firstNonEmpty(ctx.LooperTargetModel, ctx.VSRSelectedModel))
 	}
 
-	configuredRetries := 0
-	if r != nil && r.Config != nil {
-		if modelCfg, ok := r.Config.ModelConfig[route]; ok {
-			configuredRetries = modelCfg.Reliability.RetryCount
-		}
-	}
-	if override != nil && override.RetryCount != nil {
-		configuredRetries = *override.RetryCount
-	}
+	configuredRetries := configuredRetriesFromDecisionOrModel(r, ctx, override, route)
 
 	var finalRetries int
 	if ctx.LooperStreamingActive {

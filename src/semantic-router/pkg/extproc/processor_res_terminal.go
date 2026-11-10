@@ -2,15 +2,21 @@ package extproc
 
 import "github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
 
+// takeNeutralResponseUpstreamUsage extracts provider-reported usage directly from
+// the terminal semantic response without folding looper intermediate stage tokens.
+func (r *OpenAIRouter) takeNeutralResponseUpstreamUsage(ctx *RequestContext) responseUsageMetrics {
+	if r == nil || ctx == nil || ctx.SemanticResponse == nil {
+		return invalidResponseTerminalUsage("authoritative_usage_missing")
+	}
+	return responseUsageFromSemanticUsage(ctx.SemanticResponse.Usage)
+}
+
 // takeNeutralResponseUsage consumes provider-reported usage from the response
 // already decoded by the neutral protocol engine. Estimated request tokens are
 // never substituted for missing terminal evidence.
 func (r *OpenAIRouter) takeNeutralResponseUsage(ctx *RequestContext) responseUsageMetrics {
-	if r == nil || ctx == nil || ctx.SemanticResponse == nil {
-		return invalidResponseTerminalUsage("authoritative_usage_missing")
-	}
-	usage := responseUsageFromSemanticUsage(ctx.SemanticResponse.Usage)
-	if ctx.LooperStreamingActive && !usage.invalid {
+	usage := r.takeNeutralResponseUpstreamUsage(ctx)
+	if ctx != nil && ctx.LooperStreamingActive && !usage.invalid {
 		usage.promptTokens += int(ctx.LooperIntermediateUsage.PromptTokens)
 		usage.completionTokens += int(ctx.LooperIntermediateUsage.CompletionTokens)
 		usage.totalTokens += int(ctx.LooperIntermediateUsage.TotalTokens)

@@ -136,7 +136,8 @@ func (r *OpenAIRouter) Process(stream ext_proc.ExternalProcessor_ProcessServer) 
 
 		if err := r.handleProcessRequest(stream, req, ctx); err != nil {
 			r.settleAbortedLooperStreamingUsage(ctx, err)
-			state, reason := replayLifecycleForProcessError(err)
+			defaultState, defaultReason := replayLifecycleForProcessError(err)
+			state, reason := resolveReplayLifecycleState(ctx, err, defaultState, defaultReason)
 			r.finalizeRouterReplay(ctx, state, reason)
 			return err
 		}
@@ -170,11 +171,8 @@ func (r *OpenAIRouter) handleProcessReceiveError(ctx *RequestContext, err error)
 		releaseInflightAdmission(ctx)
 	}
 
-	state, reason := replayLifecycleForReceiveError(err)
-	if ctx != nil && ctx.UpstreamStatusCode > 0 && (ctx.UpstreamStatusCode < 200 || ctx.UpstreamStatusCode >= 300) {
-		state = routerreplay.LifecycleFailed
-		reason = "upstream_error_response"
-	}
+	defaultState, defaultReason := replayLifecycleForReceiveError(err)
+	state, reason := resolveReplayLifecycleState(ctx, err, defaultState, defaultReason)
 	r.finalizeRouterReplay(ctx, state, reason)
 
 	if errors.Is(err, io.EOF) {
@@ -342,7 +340,11 @@ func (r *OpenAIRouter) settleAbortedLooperStreamingUsage(ctx *RequestContext, er
 		abortStage = "upstream_prefill"
 	}
 	abortReason := "upstream_response_failed"
-	if ctx.UpstreamStatusCode < 400 {
+	if ctx != nil && ctx.SemanticStreamState != nil && ctx.SemanticStreamState.failed != nil && ctx.SemanticStreamState.failed.Code != "stream_canceled" {
+		abortReason = "upstream_error_response"
+	} else if isLooperCancellation(ctx, err) {
+		abortReason = "client_canceled"
+	} else if ctx.UpstreamStatusCode < 400 {
 		_, abortReason = replayLifecycleForReceiveError(err)
 	}
 	completionLatency := time.Duration(0)
@@ -406,6 +408,19 @@ func replayLifecycleForReceiveError(err error) (string, string) {
 		return routerreplay.LifecycleAborted, "deadline_exceeded"
 	}
 	return routerreplay.LifecycleFailed, "extproc_receive_failed"
+}
+
+func resolveReplayLifecycleState(ctx *RequestContext, err error, defaultState, defaultReason string) (string, string) {
+	if ctx != nil && ctx.UpstreamStatusCode > 0 && (ctx.UpstreamStatusCode < 200 || ctx.UpstreamStatusCode >= 300) {
+		return routerreplay.LifecycleFailed, "upstream_error_response"
+	}
+	if ctx != nil && ctx.SemanticStreamState != nil && ctx.SemanticStreamState.failed != nil && ctx.SemanticStreamState.failed.Code != "stream_canceled" {
+		return routerreplay.LifecycleFailed, "upstream_error_response"
+	}
+	if isLooperCancellation(ctx, err) {
+		return routerreplay.LifecycleAborted, "client_canceled"
+	}
+	return defaultState, defaultReason
 }
 
 func handleProcessStatusError(ctx *RequestContext, err error) bool {

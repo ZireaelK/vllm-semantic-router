@@ -10,6 +10,8 @@ import (
 	"time"
 
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/contextcompression"
@@ -144,7 +146,36 @@ func (buffers *semanticStreamBuffers) recordError(ctx *RequestContext, err error
 		return
 	}
 	buffers.streamErr = err
-	ctx.StreamingAborted = true
+	if ctx != nil {
+		ctx.StreamingAborted = true
+		if ctx.SemanticStreamState != nil && (overwrite || ctx.SemanticStreamState.failed == nil) {
+			var protoErr *llmprotocol.ProtocolError
+			if errors.As(err, &protoErr) {
+				ctx.SemanticStreamState.failed = protoErr
+			} else if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+				ctx.SemanticStreamState.failed = llmprotocol.NewError(
+					llmprotocol.ErrorUpstreamUnavailable,
+					"stream_canceled",
+					err.Error(),
+					err,
+				)
+			} else if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
+				ctx.SemanticStreamState.failed = llmprotocol.NewError(
+					llmprotocol.ErrorUpstreamUnavailable,
+					"stream_timeout",
+					err.Error(),
+					err,
+				)
+			} else {
+				ctx.SemanticStreamState.failed = llmprotocol.NewError(
+					llmprotocol.ErrorInternal,
+					"stream_decode_failed",
+					err.Error(),
+					nil,
+				)
+			}
+		}
+	}
 }
 
 func appendProtocolFrames(body []byte, frames [][]byte) []byte {
@@ -501,8 +532,12 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 	ctx.InflightToken = 0
 
 	usage := r.takeNeutralResponseUsage(ctx)
+	upstreamUsage := usage
+	if ctx != nil && ctx.LooperStreamingActive {
+		upstreamUsage = r.takeNeutralResponseUpstreamUsage(ctx)
+	}
 	// Decoded stream events carry the client-facing model, not the provider's.
-	observeUpstreamResponse(ctx, "", usage)
+	observeUpstreamResponse(ctx, "", upstreamUsage)
 	r.reportSemanticStreamingUsage(ctx, completionLatency, usage)
 	if ctx.LooperStreamingActive {
 		if !usage.invalid && !ctx.StreamingAborted && responseErr == nil {
@@ -535,11 +570,8 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 	calibrationPromptTokens := usage.promptTokens
 	if ctx.LooperStreamingActive {
 		calibrationPromptTokens = 0
-		if ctx.SemanticResponse != nil {
-			synthesisUsage := responseUsageFromSemanticUsage(ctx.SemanticResponse.Usage)
-			if !synthesisUsage.invalid {
-				calibrationPromptTokens = synthesisUsage.promptTokens
-			}
+		if !upstreamUsage.invalid {
+			calibrationPromptTokens = upstreamUsage.promptTokens
 		}
 	}
 	r.calibrateTokenEstimatorForModel(

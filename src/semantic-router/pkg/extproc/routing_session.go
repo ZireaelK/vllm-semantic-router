@@ -68,6 +68,7 @@ func (r *OpenAIRouter) newRoutingSession(ctx context.Context, release func()) *r
 		release: release,
 		// Request bodies arrive whole, as Envoy delivers them in BUFFERED mode.
 		ctx: &RequestContext{
+			Context: ctx,
 			Headers: make(map[string]string), TraceContext: ctx, BufferedRequestBody: true,
 			ConfigVersion: r.configVersion.Load(),
 		},
