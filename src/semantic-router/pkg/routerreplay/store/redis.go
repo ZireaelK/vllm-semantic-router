@@ -355,6 +355,17 @@ func (r *RedisStore) UpdateToolTrace(ctx context.Context, id string, trace ToolT
 	})
 }
 
+// UpdateFusionQuorum updates fusion quorum diagnostics for an existing record.
+func (r *RedisStore) UpdateFusionQuorum(ctx context.Context, id string, quorum FusionQuorumDiagnostics) error {
+	return r.updateRecord(ctx, id, func(record *Record) bool {
+		if record.RouteDiagnostics == nil {
+			record.RouteDiagnostics = &RouteDiagnostics{}
+		}
+		record.RouteDiagnostics.FusionQuorum = cloneFusionQuorumDiagnostics(&quorum)
+		return true
+	})
+}
+
 // updateRecord serializes Redis read-modify-write operations through the
 // async writer. Reading inside the queued operation prevents a later update
 // from overwriting fields written by an earlier queued operation with a stale

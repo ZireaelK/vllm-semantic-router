@@ -94,6 +94,7 @@ const (
 
 // RequestContext holds the context for processing a request.
 type RequestContext struct {
+	Context                   context.Context
 	learningPreview           *routerLearningPreviewSnapshot // Request-local, read-only selection state; never used by generation.
 	AutomaticCandidateDemands map[string]selection.CandidateDemand
 	BenchmarkModelUsage       string // Router-owned bounded accounting receipt; never copied from client or cache.
@@ -426,19 +427,22 @@ type RequestContext struct {
 	ShadowDispatchPluginConfig *config.ShadowDispatchPluginConfig
 
 	// Looper context
-	LooperRequest             bool                        // True only for a request-graph hop: in process, or token-authenticated
-	Hop                       *routing.Hop                // The routing context of a hop served in process
-	LooperIteration           int                         // The iteration number if this is a looper request
-	LooperLogprobs            *looperLogprobOptions       // Native Chat evidence requested by an authenticated internal hop
-	LooperStreamingActive     bool              // True when a native streaming final stage is dispatched through Envoy
-	LooperTargetModel         string            // Physical target model executing the streamed final stage
-	LooperSynthesisTextBytes  int               // Semantic text bytes of the dispatched synthesis request for token calibration
-	LooperIntermediateUsage   looper.TokenUsage // Token usage accumulated from intermediate panel/analysis stages
-	LooperTrace               any               // Execution trace from intermediate stages (e.g. *looper.FusionTrace, *workflowTrace, []RoundResponse)
-	LooperModelsUsed          []string          // All model identifiers used across intermediate panel stages
-	LooperIterations          int               // Intermediate execution call/iteration count
-	LooperAuditedOutputTokens int               // Estimated output tokens audited from SSE deltas before disconnect
-	LooperUsageSettled        bool              // True once terminal or aborted Looper streaming usage has been settled
+	LooperRequest               bool                        // True only for a request-graph hop: in process, or token-authenticated
+	Hop                         *routing.Hop                // The routing context of a hop served in process
+	LooperIteration             int                         // The iteration number if this is a looper request
+	LooperLogprobs              *looperLogprobOptions       // Native Chat evidence requested by an authenticated internal hop
+	LooperStreamingActive       bool                        // True when a native streaming final stage is dispatched through Envoy
+	LooperRemainingBudget       int                         // Remaining upstream physical call budget for the dispatched final stage
+	LooperTargetModel           string                      // Physical target model executing the streamed final stage
+	LooperSynthesisTextBytes    int                         // Semantic text bytes of the dispatched synthesis request for token calibration
+	LooperSynthesisPromptTokens int                         // Known or estimated prompt tokens of the dispatched synthesis request
+	LooperIntermediateUsage     looper.TokenUsage           // Token usage accumulated from intermediate panel/analysis stages
+	LooperTrace                 any                         // Execution trace from intermediate stages (e.g. *looper.FusionTrace, *workflowTrace, []RoundResponse)
+	LooperModelsUsed            []string                    // All model identifiers used across intermediate panel stages
+	LooperIterations            int                         // Intermediate execution call/iteration count
+	LooperAuditedOutputTokens   int                         // Estimated output tokens audited from SSE deltas before disconnect
+	LooperUsageSettled          bool                        // True once terminal or aborted Looper streaming usage has been settled
+	PendingLooperQuorumOutcome  *looper.FusionQuorumOutcome // Bounded Fusion quorum fallback outcome awaiting response completion
 
 	// ListenerModels, when set, are the only request models the listener the
 	// client request arrived on accepts.
@@ -540,10 +544,16 @@ type RequestContext struct {
 // embeddingContext returns the request-scoped context for outbound embedding
 // calls, so a client disconnect cancels in-flight remote embedding RPCs.
 func (ctx *RequestContext) embeddingContext() context.Context {
-	if ctx == nil || ctx.TraceContext == nil {
+	if ctx == nil {
 		return context.Background()
 	}
-	return ctx.TraceContext
+	if ctx.TraceContext != nil {
+		return ctx.TraceContext
+	}
+	if ctx.Context != nil {
+		return ctx.Context
+	}
+	return context.Background()
 }
 
 // HasPersonalizedContext returns true if the request/response is tainted with user-specific

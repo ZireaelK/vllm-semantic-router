@@ -3,9 +3,11 @@ package extproc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	http_ext "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/inflight"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/looper"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
@@ -92,6 +95,9 @@ func (r *OpenAIRouter) Process(stream ext_proc.ExternalProcessor_ProcessServer) 
 	// CGO inference calls) so a single bad request cannot take down the gRPC server.
 	defer func() {
 		if rec := recover(); rec != nil {
+			if ctx != nil {
+				r.settleAbortedLooperStreamingUsage(ctx, fmt.Errorf("processor_panic: %v", rec))
+			}
 			r.finalizeRouterReplay(ctx, routerreplay.LifecycleFailed, "processor_panic")
 			logging.Errorf("Process: recovered panic: %v\n%s", rec, debug.Stack())
 			retErr = status.Errorf(codes.Internal, "internal error: %v", rec)
@@ -110,9 +116,13 @@ func (r *OpenAIRouter) Process(stream ext_proc.ExternalProcessor_ProcessServer) 
 
 	// Initialize request context
 	ctx = &RequestContext{
+		Context:       stream.Context(),
 		Headers:       make(map[string]string),
 		TraceContext:  stream.Context(),
 		ConfigVersion: r.configVersion.Load(),
+	}
+	if r.OnRequestContext != nil {
+		r.OnRequestContext(ctx)
 	}
 
 	for {
@@ -161,7 +171,7 @@ func (r *OpenAIRouter) handleProcessReceiveError(ctx *RequestContext, err error)
 	}
 
 	state, reason := replayLifecycleForReceiveError(err)
-	if ctx != nil && ctx.UpstreamStatusCode >= 400 {
+	if ctx != nil && ctx.UpstreamStatusCode > 0 && (ctx.UpstreamStatusCode < 200 || ctx.UpstreamStatusCode >= 300) {
 		state = routerreplay.LifecycleFailed
 		reason = "upstream_error_response"
 	}
@@ -184,8 +194,83 @@ func (r *OpenAIRouter) handleProcessReceiveError(ctx *RequestContext, err error)
 	return err
 }
 
+func isLooperCancellation(ctx *RequestContext, err error) bool {
+	if ctx != nil && ctx.UpstreamStatusCode > 0 && (ctx.UpstreamStatusCode < 200 || ctx.UpstreamStatusCode >= 300) {
+		return false
+	}
+	if err != nil && strings.Contains(err.Error(), "processor_panic") {
+		return false
+	}
+
+	if ctx != nil && ctx.SemanticStreamState != nil {
+		if ctx.SemanticStreamState.failed != nil {
+			if ctx.SemanticStreamState.failed.Code != "stream_canceled" {
+				return false
+			}
+		} else if !ctx.SemanticStreamState.terminal && !errors.Is(err, context.Canceled) && status.Code(err) != codes.Canceled &&
+			(ctx.Context == nil || !errors.Is(ctx.Context.Err(), context.Canceled)) &&
+			(ctx.TraceContext == nil || !errors.Is(ctx.TraceContext.Err(), context.Canceled)) {
+			return false
+		}
+	}
+
+	var protoErr *llmprotocol.ProtocolError
+	if errors.As(err, &protoErr) && protoErr.Code != "stream_canceled" {
+		return false
+	}
+
+	if err != nil {
+		errStr := err.Error()
+		if strings.Contains(errStr, "stream_incomplete") ||
+			strings.Contains(errStr, "upstream_stream_incomplete") ||
+			strings.Contains(errStr, "incomplete") {
+			return false
+		}
+		if strings.Contains(errStr, "semantic stream failed:") && !strings.Contains(errStr, "stream_canceled") {
+			return false
+		}
+	}
+
+	if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+		return true
+	}
+	if ctx != nil {
+		if ctx.Context != nil && errors.Is(ctx.Context.Err(), context.Canceled) {
+			return true
+		}
+		if ctx.TraceContext != nil && errors.Is(ctx.TraceContext.Err(), context.Canceled) {
+			return true
+		}
+		if ctx.SemanticStreamState != nil && ctx.SemanticStreamState.failed != nil && ctx.SemanticStreamState.failed.Code == "stream_canceled" {
+			return true
+		}
+	}
+	if err != nil {
+		errStr := err.Error()
+		if strings.Contains(errStr, "client_canceled") ||
+			strings.Contains(errStr, "connection dropped") ||
+			strings.Contains(errStr, "context canceled") {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (r *OpenAIRouter) settleAbortedLooperStreamingUsage(ctx *RequestContext, err error) {
-	if r == nil || ctx == nil || !ctx.LooperStreamingActive || ctx.LooperUsageSettled {
+	if r == nil || ctx == nil {
+		return
+	}
+	if ctx.PendingLooperQuorumOutcome != nil {
+		disposition := looper.FusionQuorumResponseEncodeFailed
+		if isLooperCancellation(ctx, err) {
+			disposition = looper.FusionQuorumCancelled
+		}
+		ctx.PendingLooperQuorumOutcome.Disposition = disposition
+		finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
+		ctx.PendingLooperQuorumOutcome = nil
+	}
+	if !ctx.LooperStreamingActive || ctx.LooperUsageSettled {
 		return
 	}
 	ctx.LooperUsageSettled = true
@@ -194,14 +279,48 @@ func (r *OpenAIRouter) settleAbortedLooperStreamingUsage(ctx *RequestContext, er
 		recordSessionTurnOutcome(ctx, responseUsageMetrics{})
 	}
 
-	if estimated := estimateAbortedLooperOutputTokens(ctx.SemanticStreamState); estimated > 0 {
-		ctx.LooperAuditedOutputTokens += estimated
+	synthesisPromptTokens := 0
+	synthesisCompletionTokens := 0
+
+	authoritativePrompt, authoritativeCompletion, hasAuthoritativeUsage := extractAuthoritativeStreamUsage(ctx.SemanticStreamState)
+	if hasAuthoritativeUsage {
+		synthesisPromptTokens = authoritativePrompt
+		synthesisCompletionTokens = authoritativeCompletion
+		ctx.LooperAuditedOutputTokens = synthesisCompletionTokens
+	} else {
+		if estimated := estimateAbortedLooperOutputTokens(ctx.SemanticStreamState); estimated > 0 {
+			ctx.LooperAuditedOutputTokens += estimated
+		}
+		synthesisCompletionTokens = ctx.LooperAuditedOutputTokens
+		if synthesisCompletionTokens > 0 {
+			if ctx.LooperSynthesisPromptTokens > 0 {
+				synthesisPromptTokens = ctx.LooperSynthesisPromptTokens
+			} else if ctx.LooperSynthesisTextBytes > 0 {
+				if r != nil && r.Classifier != nil {
+					if tokens, ok := r.Classifier.EstimateTokens(calibrationTargetModel(ctx), ctx.LooperSynthesisTextBytes); ok && tokens > 0 {
+						synthesisPromptTokens = tokens
+					}
+				}
+				if synthesisPromptTokens <= 0 {
+					synthesisPromptTokens = max(1, (ctx.LooperSynthesisTextBytes+3)/4)
+				}
+			}
+		}
 	}
 
-	promptTokens := int(ctx.LooperIntermediateUsage.PromptTokens)
-	completionTokens := int(ctx.LooperIntermediateUsage.CompletionTokens) + ctx.LooperAuditedOutputTokens
+	promptTokens := int(ctx.LooperIntermediateUsage.PromptTokens) + synthesisPromptTokens
+	completionTokens := int(ctx.LooperIntermediateUsage.CompletionTokens) + synthesisCompletionTokens
 	totalTokens := promptTokens + completionTokens
 
+	if ctx.RouterReplayID == "" {
+		model := firstNonEmpty(ctx.RequestModel, ctx.LooperTargetModel, ctx.VSRSelectedModel)
+		target := firstNonEmpty(ctx.LooperTargetModel, ctx.VSRSelectedModel)
+		decisionName := ctx.VSRSelectedDecisionName
+		if decisionName == "" && ctx.VSRSelectedDecision != nil {
+			decisionName = ctx.VSRSelectedDecision.Name
+		}
+		r.startRouterReplay(ctx, model, target, decisionName)
+	}
 	if ctx.RouterReplayID != "" {
 		r.updateRouterReplayUsageCost(ctx, routerreplay.UsageCost{
 			PromptTokens:     replayIntPtr(promptTokens),
@@ -230,6 +349,10 @@ func (r *OpenAIRouter) settleAbortedLooperStreamingUsage(ctx *RequestContext, er
 	if !ctx.StartTime.IsZero() {
 		completionLatency = time.Since(ctx.StartTime)
 	}
+	usageProvenance := "estimated"
+	if hasAuthoritativeUsage {
+		usageProvenance = "authoritative"
+	}
 	eventFields := map[string]interface{}{
 		"request_id":                     ctx.RequestID,
 		"model":                          firstNonEmpty(ctx.RequestModel, ctx.LooperTargetModel, ctx.VSRSelectedModel),
@@ -241,7 +364,7 @@ func (r *OpenAIRouter) settleAbortedLooperStreamingUsage(ctx *RequestContext, er
 		"audited_stream_output_tokens":   ctx.LooperAuditedOutputTokens,
 		"completion_tokens":              completionTokens,
 		"total_tokens":                   totalTokens,
-		"usage_provenance":               "estimated",
+		"usage_provenance":               usageProvenance,
 		"stream_aborted":                 true,
 		"abort_stage":                    abortStage,
 		"abort_reason":                   abortReason,
@@ -249,6 +372,9 @@ func (r *OpenAIRouter) settleAbortedLooperStreamingUsage(ctx *RequestContext, er
 		"cost":                           0.0,
 		"currency":                       "unknown",
 		"pricing":                        "looper_aborted_unpriced",
+	}
+	if synthesisPromptTokens > 0 {
+		eventFields["synthesis_prompt_tokens"] = synthesisPromptTokens
 	}
 	if len(ctx.LooperModelsUsed) > 0 {
 		eventFields["looper_models_used"] = ctx.LooperModelsUsed

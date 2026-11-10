@@ -691,6 +691,66 @@ func (p *PostgresStore) UpdateToolTrace(ctx context.Context, id string, trace To
 	return fn()
 }
 
+// postgresUpdateFusionQuorumQueryTemplate is the parameterized UPDATE statement used by
+// PostgresStore.UpdateFusionQuorum. The %s placeholder receives the validated table name.
+// It uses COALESCE(NULLIF(route_diagnostics, 'null'::jsonb), '{}'::jsonb) so that both SQL NULL
+// and JSONB 'null' literals (which can arise when typed nil pointers are marshaled) are safely
+// normalized to an empty JSONB object before jsonb_set is invoked, preventing "cannot call jsonb_set on a scalar".
+const postgresUpdateFusionQuorumQueryTemplate = `
+		UPDATE %s
+		SET route_diagnostics = jsonb_set(
+			COALESCE(NULLIF(route_diagnostics, 'null'::jsonb), '{}'::jsonb),
+			'{fusion_quorum}',
+			$2::jsonb,
+			true
+		)
+		WHERE id = $1
+	`
+
+func postgresUpdateFusionQuorumQuery(tableName string) string {
+	return fmt.Sprintf(postgresUpdateFusionQuorumQueryTemplate, tableName)
+}
+
+// UpdateFusionQuorum updates fusion quorum diagnostics for a record.
+func (p *PostgresStore) UpdateFusionQuorum(ctx context.Context, id string, quorum FusionQuorumDiagnostics) error {
+	release, err := p.lifecycle.beginMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	quorumJSON, err := json.Marshal(quorum)
+	if err != nil {
+		return fmt.Errorf("failed to marshal fusion quorum diagnostics: %w", err)
+	}
+
+	//nolint:gosec // tableName is validated during store creation
+	query := postgresUpdateFusionQuorumQuery(p.tableName)
+
+	fn := func() error {
+		result, err := p.db.ExecContext(ctx, query, id, quorumJSON)
+		if err != nil {
+			return fmt.Errorf("failed to update fusion quorum: %w", err)
+		}
+
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows == 0 {
+			return fmt.Errorf("record with ID %s not found", id)
+		}
+
+		return nil
+	}
+
+	if p.asyncWrites {
+		return p.runAsyncAndWait(ctx, fn)
+	}
+
+	return fn()
+}
+
 // cleanupOldRecords removes records older than the TTL.
 func (p *PostgresStore) cleanupOldRecords(ctx context.Context) error {
 	if p.ttl == 0 {

@@ -1,7 +1,9 @@
 package extproc
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -87,6 +89,13 @@ func (buffers *semanticStreamBuffers) push(responseBody []byte, ctx *RequestCont
 	if len(responseBody) == 0 {
 		return
 	}
+	if buffers.streamErr == nil && ctx != nil {
+		if ctx.Context != nil && errors.Is(ctx.Context.Err(), context.Canceled) {
+			buffers.recordError(ctx, ctx.Context.Err(), true)
+		} else if ctx.TraceContext != nil && errors.Is(ctx.TraceContext.Err(), context.Canceled) {
+			buffers.recordError(ctx, ctx.TraceContext.Err(), true)
+		}
+	}
 	if ctx.PublicChatUsageFilter != nil {
 		filtered, err := ctx.PublicChatUsageFilter.Push(responseBody)
 		buffers.public = append(buffers.public, filtered...)
@@ -104,6 +113,13 @@ func (buffers *semanticStreamBuffers) push(responseBody []byte, ctx *RequestCont
 }
 
 func (buffers *semanticStreamBuffers) finalize(ctx *RequestContext) {
+	if buffers.streamErr == nil && ctx != nil {
+		if ctx.Context != nil && errors.Is(ctx.Context.Err(), context.Canceled) {
+			buffers.recordError(ctx, ctx.Context.Err(), true)
+		} else if ctx.TraceContext != nil && errors.Is(ctx.TraceContext.Err(), context.Canceled) {
+			buffers.recordError(ctx, ctx.TraceContext.Err(), true)
+		}
+	}
 	if ctx.ProtocolResponseStream != nil {
 		// A failure the Router raised, in this read or an earlier one, is not the
 		// provider's error event, so its frame stays on the abort path.
@@ -153,12 +169,30 @@ func observeProtocolStream(
 	ctx.SemanticStreamState.observe(events)
 }
 
+func extractAuthoritativeStreamUsage(state *semanticResponseStreamState) (int, int, bool) {
+	if state == nil || state.usage.State != llmprotocol.UsageAvailable {
+		return 0, 0, false
+	}
+	metrics := responseUsageFromSemanticUsage(state.usage)
+	if !metrics.invalid {
+		return metrics.promptTokens, metrics.completionTokens, true
+	}
+	return 0, 0, false
+}
+
 func estimateAbortedLooperOutputTokens(state *semanticResponseStreamState) int {
 	if state == nil || len(state.items) == 0 {
 		return 0
 	}
+	keys := make([]int, 0, len(state.items))
+	for k := range state.items {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+
 	var b strings.Builder
-	for _, item := range state.items {
+	for _, k := range keys {
+		item := state.items[k]
 		if item == nil {
 			continue
 		}
@@ -383,8 +417,20 @@ func (state *semanticResponseStreamState) item(index int) *semanticStreamItem {
 
 //nolint:cyclop // Response assembly validates every terminal stream invariant in one place.
 func (state *semanticResponseStreamState) response() (*llmprotocol.Response, error) {
-	if state == nil || state.failed != nil || !state.terminal {
-		return nil, fmt.Errorf("semantic stream did not complete successfully")
+	if state == nil {
+		return nil, fmt.Errorf("semantic stream incomplete: nil stream state")
+	}
+	if state.failed != nil {
+		if state.failed.Code != "" && state.failed.Message != "" {
+			return nil, fmt.Errorf("semantic stream failed: %s: %s", state.failed.Code, state.failed.Message)
+		}
+		if state.failed.Code != "" {
+			return nil, fmt.Errorf("semantic stream failed: %s", state.failed.Code)
+		}
+		return nil, fmt.Errorf("semantic stream failed: %s", state.failed.Message)
+	}
+	if !state.terminal {
+		return nil, fmt.Errorf("semantic stream incomplete: stream ended without terminal event")
 	}
 	indices := append([]int(nil), state.order...)
 	sort.SliceStable(indices, func(left, right int) bool { return indices[left] < indices[right] })
@@ -459,7 +505,7 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 	observeUpstreamResponse(ctx, "", usage)
 	r.reportSemanticStreamingUsage(ctx, completionLatency, usage)
 	if ctx.LooperStreamingActive {
-		if !usage.invalid {
+		if !usage.invalid && !ctx.StreamingAborted && responseErr == nil {
 			ctx.LooperUsageSettled = true
 			logging.ComponentEvent("extproc", "looper_streaming_completed", map[string]interface{}{
 				"request_id":        ctx.RequestID,
@@ -476,7 +522,11 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 		} else {
 			abortErr := streamErr
 			if abortErr == nil {
-				abortErr = responseErr
+				if ctx.SemanticStreamState != nil && ctx.SemanticStreamState.failed != nil {
+					abortErr = ctx.SemanticStreamState.failed
+				} else {
+					abortErr = responseErr
+				}
 			}
 			r.settleAbortedLooperStreamingUsage(ctx, abortErr)
 		}
@@ -501,7 +551,17 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 
 	if responseErr != nil || usage.invalid {
 		ctx.StreamingAborted = true
-		r.finalizeRouterReplay(ctx, routerreplay.LifecycleFailed, "upstream_stream_incomplete")
+		abortErr := streamErr
+		if abortErr == nil {
+			abortErr = responseErr
+		}
+		replayState := routerreplay.LifecycleFailed
+		replayReason := "upstream_stream_incomplete"
+		if isLooperCancellation(ctx, abortErr) {
+			replayState = routerreplay.LifecycleAborted
+			replayReason = "client_canceled"
+		}
+		r.finalizeRouterReplay(ctx, replayState, replayReason)
 	}
 
 	if responseErr != nil {
@@ -510,6 +570,10 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 			"error":      responseErr.Error(),
 		})
 		r.recordUnscheduledResponseMemoryStore(ctx, "skipped", "stream_incomplete", true)
+		if ctx.PendingLooperQuorumOutcome != nil {
+			finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
+			ctx.PendingLooperQuorumOutcome = nil
+		}
 		return
 	}
 	recordPrimaryOutputDigest(ctx, semanticResponse)
@@ -522,12 +586,27 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 			"error":      err.Error(),
 		})
 		r.recordUnscheduledResponseMemoryStore(ctx, "skipped", "stream_encode_failed", true)
+		if ctx.PendingLooperQuorumOutcome != nil {
+			finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
+			ctx.PendingLooperQuorumOutcome = nil
+		}
 		return
 	}
 	if !ctx.LooperStreamingActive {
 		r.updateResponseCache(ctx, encoded)
 	}
 	r.updateKVAddressRegistry(ctx)
+
+	if ctx.PendingLooperQuorumOutcome != nil {
+		if ctx.StreamingAborted {
+			ctx.PendingLooperQuorumOutcome.Disposition = looper.FusionQuorumResponseEncodeFailed
+			finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
+		} else {
+			finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, true)
+		}
+		ctx.PendingLooperQuorumOutcome = nil
+	}
+
 	r.scheduleSemanticResponseMemoryStore(ctx, semanticResponse)
 	r.persistResponseObject(ctx)
 	r.attachRouterReplayResponse(ctx, attachLooperTraceToReplaySnapshot(ctx, encoded), true)

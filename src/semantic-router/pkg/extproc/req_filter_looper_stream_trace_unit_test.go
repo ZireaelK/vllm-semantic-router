@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,8 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/authz"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/classification"
@@ -26,8 +29,10 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/headers"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/looper"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/protocolcodec"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay/store"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing/budget"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/selection"
 )
 
@@ -157,7 +162,8 @@ func TestLooperStreamingDispatch_QuorumFallbackStreams(t *testing.T) {
 	require.Equal(t, "backup-model", selectedModelHeader)
 	require.Equal(t, "backup-model", reqCtx.VSRSelectedModel)
 	require.True(t, reqCtx.LooperStreamingActive)
-	require.NotNil(t, reqCtx.VSRFusionQuorum)
+	require.NotNil(t, reqCtx.PendingLooperQuorumOutcome)
+	require.Nil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must remain unfinalized during dispatch phase")
 }
 
 func TestLooperStreamingDispatch_FailFastOnQuorumFailure(t *testing.T) {
@@ -578,6 +584,10 @@ func TestLooperStreamingTokenCalibration_UsesPhysicalTargetModelNeverAlias(t *te
 					Value:      replayInt64Ptr(50),
 					Provenance: llmprotocol.UsageAuthoritative,
 				},
+				Total: llmprotocol.TokenCount{
+					Value:      replayInt64Ptr(synthesisPromptTokens + 50),
+					Provenance: llmprotocol.UsageAuthoritative,
+				},
 			},
 		}
 		ctx := &RequestContext{
@@ -950,7 +960,10 @@ func TestLooperStreaming_ShouldStreamLooperFinalStageGate(t *testing.T) {
 		SourceFormat:            llmprotocol.OpenAIChatV1,
 	}
 	request := &llmprotocol.Request{Stream: true}
-	ownership := looper.StageOwnership{Eligibility: looper.StreamingEligible}
+	ownership := looper.StageOwnership{
+		Eligibility: looper.StreamingEligible,
+		TargetModel: "judge",
+	}
 
 	fusionDecision := &config.Decision{
 		Algorithm: &config.AlgorithmConfig{Type: config.DecisionAlgorithmFusion},
@@ -965,8 +978,108 @@ func TestLooperStreaming_ShouldStreamLooperFinalStageGate(t *testing.T) {
 	// Non-fusion algorithm -> false
 	require.False(t, routerEnabled.shouldStreamLooperFinalStage(ownership, reqCtx, request, confidenceDecision))
 
-	// Fusion algorithm and enabled -> true
+	// Target model cannot be determined -> false (safety fallback to buffered path)
+	emptyOwnership := looper.StageOwnership{Eligibility: looper.StreamingEligible}
+	require.False(t, routerEnabled.shouldStreamLooperFinalStage(emptyOwnership, reqCtx, request, fusionDecision))
+
+	// Fusion algorithm and enabled with valid target model -> true
 	require.True(t, routerEnabled.shouldStreamLooperFinalStage(ownership, reqCtx, request, fusionDecision))
+
+	t.Run("AnthropicAnalysisModelFallsBackToBuffering", func(t *testing.T) {
+		router := &OpenAIRouter{
+			Config: &config.RouterConfig{
+				Looper: config.LooperConfig{
+					Streaming: config.LooperStreamingConfig{Enabled: nil},
+				},
+				BackendModels: config.BackendModels{
+					ModelConfig: map[string]config.ModelParams{
+						"chat-model":      {APIFormat: config.APIFormatOpenAI},
+						"anthropic-model": {APIFormat: config.APIFormatAnthropic},
+					},
+				},
+			},
+		}
+
+		decision := &config.Decision{
+			Name: "fusion-anthropic-analysis",
+			ModelRefs: []config.ModelRef{
+				{Model: "chat-model"},
+			},
+			Algorithm: &config.AlgorithmConfig{
+				Type: config.DecisionAlgorithmFusion,
+				Fusion: &config.FusionAlgorithmConfig{
+					AnalysisModels: []string{"anthropic-model"},
+				},
+			},
+		}
+
+		// When looper request resolves stage ownership without explicit fusion.model,
+		// TargetModel is resolved to AnalysisModels[0].
+		looperReq := &looper.Request{
+			Algorithm:   decision.Algorithm,
+			ModelRefs:   decision.ModelRefs,
+			IsStreaming: true,
+		}
+		stageOwnership := looper.ResolveFinalStageOwnership(looperReq)
+		require.Equal(t, "anthropic-model", stageOwnership.TargetModel)
+		require.Equal(t, looper.StreamingEligible, stageOwnership.Eligibility)
+
+		// Even though decision.ModelRefs[0] is an OpenAI Chat model, the actual synthesis
+		// target is anthropic-model (non-OpenAI format), so the gate must return false.
+		require.False(t, router.shouldStreamLooperFinalStage(stageOwnership, reqCtx, request, decision))
+	})
+
+	t.Run("HandleLooperExecutionFallsBackToBufferedWhenAnalysisModelIsAnthropic", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				Model string `json:"model"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+			writeFusionReplayCompletion(w, req.Model, []map[string]interface{}{{
+				"index": 0,
+				"message": map[string]interface{}{
+					"role":    "assistant",
+					"content": "Synthesized response from " + req.Model,
+				},
+				"finish_reason": "stop",
+			}}, map[string]int64{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+		}))
+		defer server.Close()
+
+		router, execReqCtx, execRequest := quorumFallbackRouter(server.URL)
+		router.Config.BackendModels.ModelConfig["chat-model"] = config.ModelParams{
+			APIFormat:    config.APIFormatOpenAI,
+			Capabilities: []string{"chat"},
+		}
+		router.Config.BackendModels.ModelConfig["anthropic-model"] = config.ModelParams{
+			APIFormat:    config.APIFormatAnthropic,
+			Capabilities: []string{"chat"},
+		}
+		execReqCtx.ExpectStreamingResponse = true
+		execRequest.Stream = true
+
+		decision := &config.Decision{
+			Name: "fusion-fallback-to-buffered",
+			ModelRefs: []config.ModelRef{
+				{Model: "chat-model"},
+			},
+			Algorithm: &config.AlgorithmConfig{
+				Type: config.DecisionAlgorithmFusion,
+				Fusion: &config.FusionAlgorithmConfig{
+					AnalysisModels: []string{"anthropic-model"},
+					AnalysisMode:   config.FusionAnalysisModeOneCall,
+				},
+			},
+		}
+
+		response, err := router.handleLooperExecution(context.Background(), execRequest, decision, execReqCtx)
+		require.NoError(t, err)
+		require.NotNil(t, response)
+
+		// In buffered mode, response returns an ImmediateResponse instead of native streaming CONTINUE
+		require.NotNil(t, response.GetImmediateResponse(), "expected immediate buffered response when streaming gate falls back")
+		require.Nil(t, response.GetRequestBody(), "did not expect native streaming continue response")
+	})
 }
 
 func TestLooperStreaming_BlocksOuterFallbackAndSettlesUpstreamTransportError(t *testing.T) {
@@ -1255,6 +1368,42 @@ func TestLooperStreaming_EmptyBody5xxMaintainsLifecycleFailed(t *testing.T) {
 	router.startRouterReplay(reqCtx, "entrypoint", "judge", "fusion-stream")
 
 	// Simulate EOF (empty body) on 502 response
+	err := router.handleProcessReceiveError(reqCtx, io.EOF)
+	require.NoError(t, err)
+
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+	require.Equal(t, "upstream_error_response", record.TerminalReason)
+}
+
+func TestLooperStreaming_EmptyBody3xxMaintainsLifecycleFailed(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{Enabled: true},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	reqCtx := &RequestContext{
+		RequestID:                "req-empty-3xx",
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &replayConfig,
+		LooperStreamingActive:    true,
+		UpstreamStatusCode:       304,
+		LooperIntermediateUsage: looper.TokenUsage{
+			PromptTokens:     10,
+			CompletionTokens: 5,
+			TotalTokens:      15,
+		},
+	}
+	router.startRouterReplay(reqCtx, "entrypoint", "judge", "fusion-stream")
+
+	// Simulate EOF (empty body) on 304 response
 	err := router.handleProcessReceiveError(reqCtx, io.EOF)
 	require.NoError(t, err)
 
@@ -1826,9 +1975,9 @@ func TestLooperStreamingDispatch_BuildResponseDoesNotMutateClientRequest(t *test
 		},
 	}
 	reqCtx := &RequestContext{
-		RequestID:              "req-legacy-test",
-		SourceFormat:           llmprotocol.OpenAIChatV1,
-		SemanticRequest:        clientReq,
+		RequestID:               "req-legacy-test",
+		SourceFormat:            llmprotocol.OpenAIChatV1,
+		SemanticRequest:         clientReq,
 		VSRSelectedDecision:     decision,
 		VSRSelectedDecisionName: decision.Name,
 	}
@@ -1918,3 +2067,2432 @@ func TestLooperFailureEvidenceFromError_FusionStageFailureError(t *testing.T) {
 	require.Nil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must not be populated when quorum was met")
 }
 
+func TestEstimateAbortedLooperOutputTokens_MapKeyOrderDeterminism(t *testing.T) {
+	// Construct state with non-sequential out-of-order map keys
+	state := &semanticResponseStreamState{
+		items: map[int]*semanticStreamItem{
+			5: {text: " world"},
+			2: {text: "hello"},
+			0: {text: "say: "},
+		},
+	}
+	tokens := estimateAbortedLooperOutputTokens(state)
+	expectedTokens := contextcompression.EstimateTokens("say: hello world")
+	require.Equal(t, expectedTokens, tokens)
+}
+
+func TestLooperStreamingAbort_AuthoritativeUsageBeforeDoneSettlement(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{
+				Enabled: true,
+			},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	reqCtx := &RequestContext{
+		RequestID:                "req-authoritative-before-done",
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &replayConfig,
+		IsStreamingResponse:      true,
+		StreamingComplete:        false,
+		LooperStreamingActive:    true,
+		LooperIntermediateUsage: looper.TokenUsage{
+			PromptTokens:     30,
+			CompletionTokens: 15,
+			TotalTokens:      45,
+		},
+		SemanticStreamState: &semanticResponseStreamState{
+			items: make(map[int]*semanticStreamItem),
+			usage: llmprotocol.Usage{
+				State: llmprotocol.UsageAvailable,
+				InputTotal: llmprotocol.TokenCount{
+					Value:      replayInt64Ptr(18),
+					Provenance: llmprotocol.UsageAuthoritative,
+				},
+				OutputTotal: llmprotocol.TokenCount{
+					Value:      replayInt64Ptr(7),
+					Provenance: llmprotocol.UsageAuthoritative,
+				},
+				Total: llmprotocol.TokenCount{
+					Value:      replayInt64Ptr(25),
+					Provenance: llmprotocol.UsageAuthoritative,
+				},
+			},
+		},
+	}
+
+	router.startRouterReplay(reqCtx, "router-entrypoint", "judge", "fusion-stream")
+	require.NotEmpty(t, reqCtx.RouterReplayID)
+
+	// Simulate client abort/disconnect before [DONE] arrival
+	err := router.handleProcessReceiveError(reqCtx, context.Canceled)
+	require.NoError(t, err)
+	require.True(t, reqCtx.StreamingAborted)
+	require.True(t, reqCtx.LooperUsageSettled)
+
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, routerreplay.LifecycleAborted, record.LifecycleState)
+	require.Equal(t, "client_canceled", record.TerminalReason)
+	require.NotNil(t, record.PromptTokens)
+	require.NotNil(t, record.CompletionTokens)
+	require.NotNil(t, record.TotalTokens)
+
+	// Authoritative usage:
+	// PromptTokens: 30 (intermediate) + 18 (synthesis upstream authoritative) = 48
+	// CompletionTokens: 15 (intermediate) + 7 (synthesis upstream authoritative) = 22
+	// TotalTokens: 48 + 22 = 70
+	require.Equal(t, 48, *record.PromptTokens)
+	require.Equal(t, 22, *record.CompletionTokens)
+	require.Equal(t, 70, *record.TotalTokens)
+}
+
+func TestLooperStreamingAbort_OutputChunksWithoutUsageFrameEstimatedWithPromptFloor(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{
+				Enabled: true,
+			},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	chunkText := "Synthesis response output chunk generated by judge model before client disconnected."
+	expectedEstimatedOutput := contextcompression.EstimateTokens(chunkText)
+	require.Greater(t, expectedEstimatedOutput, 0)
+
+	synthesisPromptTokens := 42
+	reqCtx := &RequestContext{
+		RequestID:                   "req-chunk-without-usage",
+		RouterReplayRecorder:        recorder,
+		RouterReplayPluginConfig:    &replayConfig,
+		IsStreamingResponse:         true,
+		StreamingComplete:           false,
+		LooperStreamingActive:       true,
+		LooperSynthesisPromptTokens: synthesisPromptTokens,
+		LooperIntermediateUsage: looper.TokenUsage{
+			PromptTokens:     20,
+			CompletionTokens: 10,
+			TotalTokens:      30,
+		},
+		SemanticStreamState: &semanticResponseStreamState{
+			items: make(map[int]*semanticStreamItem),
+		},
+	}
+
+	router.startRouterReplay(reqCtx, "router-entrypoint", "judge", "fusion-stream")
+	require.NotEmpty(t, reqCtx.RouterReplayID)
+
+	// Observe delta chunks without usage tail frame
+	observeProtocolStream(reqCtx, []llmprotocol.Event{
+		{
+			Type:      llmprotocol.EventOutputTextDelta,
+			ItemIndex: 0,
+			Delta:     chunkText,
+		},
+	}, nil)
+
+	// Simulate client cancellation
+	err := router.handleProcessReceiveError(reqCtx, context.Canceled)
+	require.NoError(t, err)
+	require.True(t, reqCtx.StreamingAborted)
+	require.True(t, reqCtx.LooperUsageSettled)
+
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, routerreplay.LifecycleAborted, record.LifecycleState)
+	require.Equal(t, "client_canceled", record.TerminalReason)
+	require.NotNil(t, record.PromptTokens)
+	require.NotNil(t, record.CompletionTokens)
+	require.NotNil(t, record.TotalTokens)
+
+	// Input Tokens must not be zeroed out: 20 (intermediate) + 42 (synthesis prompt) = 62
+	require.Equal(t, 20+synthesisPromptTokens, *record.PromptTokens)
+	// Output Tokens: 10 (intermediate) + estimated output
+	require.Equal(t, 10+expectedEstimatedOutput, *record.CompletionTokens)
+	require.Equal(t, 20+synthesisPromptTokens+10+expectedEstimatedOutput, *record.TotalTokens)
+}
+
+func TestLooperStreamingAbort_OutputChunksWithoutUsageFrameFallbackToSynthesisBytes(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{
+				Enabled: true,
+			},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	chunkText := "Partial output before cancel."
+	expectedEstimatedOutput := contextcompression.EstimateTokens(chunkText)
+	require.Greater(t, expectedEstimatedOutput, 0)
+
+	synthesisBytes := 120
+	expectedEstimatedPromptFloor := (synthesisBytes + 3) / 4 // 30 tokens
+
+	reqCtx := &RequestContext{
+		RequestID:                   "req-chunk-bytes-fallback",
+		RouterReplayRecorder:        recorder,
+		RouterReplayPluginConfig:    &replayConfig,
+		IsStreamingResponse:         true,
+		StreamingComplete:           false,
+		LooperStreamingActive:       true,
+		LooperSynthesisPromptTokens: 0, // Not explicitly set, fallback to bytes
+		LooperSynthesisTextBytes:    synthesisBytes,
+		LooperIntermediateUsage: looper.TokenUsage{
+			PromptTokens:     15,
+			CompletionTokens: 5,
+			TotalTokens:      20,
+		},
+		SemanticStreamState: &semanticResponseStreamState{
+			items: make(map[int]*semanticStreamItem),
+		},
+	}
+
+	router.startRouterReplay(reqCtx, "router-entrypoint", "judge", "fusion-stream")
+	require.NotEmpty(t, reqCtx.RouterReplayID)
+
+	observeProtocolStream(reqCtx, []llmprotocol.Event{
+		{
+			Type:      llmprotocol.EventOutputTextDelta,
+			ItemIndex: 0,
+			Delta:     chunkText,
+		},
+	}, nil)
+
+	err := router.handleProcessReceiveError(reqCtx, context.Canceled)
+	require.NoError(t, err)
+	require.True(t, reqCtx.StreamingAborted)
+
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, 15+expectedEstimatedPromptFloor, *record.PromptTokens)
+	require.Equal(t, 5+expectedEstimatedOutput, *record.CompletionTokens)
+	require.Equal(t, 15+expectedEstimatedPromptFloor+5+expectedEstimatedOutput, *record.TotalTokens)
+}
+
+func TestLooperStreamingAbort_CompressedLargeRequestSettlesPostCompressionPromptTokens(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+
+	router, model := routingTestRouterForFormat(llmprotocol.OpenAIChatV1)
+	router.ReplayRecorder = recorder
+	router.Config.RouterReplay = config.RouterReplayConfig{
+		Enabled: true,
+	}
+	router.Config.DefaultModel = "virtual-entrypoint"
+	router.Config.CandidateRequirements = &config.CandidateRequirements{
+		Capabilities: config.CandidateCapabilitiesDeclared,
+		Context:      config.CandidateContextKnownLimits,
+	}
+	params := router.Config.ModelConfig[model]
+	params.Capabilities = []string{"chat"}
+	params.ContextWindowSize = 32768
+	params.MaxOutputTokens = 8192
+	router.Config.ModelConfig[model] = params
+
+	payload, err := config.NewStructuredPayload(map[string]any{
+		"enabled": true,
+		"targets": map[string]any{
+			"current_user": map[string]any{"mode": "truncate"},
+			"history":      map[string]any{"mode": "extractive", "min_tokens": 2000, "target_tokens": 1000},
+			"tool_outputs": map[string]any{"mode": "preserve"},
+		},
+	})
+	require.NoError(t, err)
+
+	decision := &config.Decision{
+		Name:      "fusion-compression-decision",
+		ModelRefs: []config.ModelRef{{Model: model}},
+		Algorithm: &config.AlgorithmConfig{
+			Type: config.DecisionAlgorithmFusion,
+			Fusion: &config.FusionAlgorithmConfig{
+				Model: model,
+			},
+		},
+		Plugins: []config.DecisionPlugin{
+			{Type: "context_compression", Configuration: payload},
+		},
+	}
+	router.Config.Decisions = []config.Decision{*decision}
+	router.Config.Signals.ContextRules = []config.ContextRule{{
+		Name:      "window",
+		MinTokens: config.TokenCount("100K"),
+	}}
+
+	classifier, err := classification.BuildClassifier(router.Config, nil, nil, nil)
+	require.NoError(t, err)
+	router.Classifier = classifier
+
+	clientReq := &llmprotocol.Request{
+		Model: "client-entrypoint",
+		Messages: []llmprotocol.Message{
+			{Role: "user", Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: "original client query"}}},
+		},
+	}
+	reqCtx := &RequestContext{
+		RequestID:                "req-compress-abort-trace",
+		SourceFormat:             llmprotocol.OpenAIChatV1,
+		SemanticRequest:          clientReq,
+		VSRSelectedDecision:      decision,
+		VSRSelectedDecisionName:  decision.Name,
+		TraceContext:             context.Background(),
+		ExpectStreamingResponse:  true,
+		IsStreamingResponse:      true,
+		StreamingComplete:        false,
+		LooperStreamingActive:    true,
+		RouterReplayRecorder:     recorder,
+		RouterReplayPluginConfig: &replayConfig,
+		LooperIntermediateUsage: looper.TokenUsage{
+			PromptTokens:     20,
+			CompletionTokens: 10,
+			TotalTokens:      30,
+		},
+		SemanticStreamState: &semanticResponseStreamState{
+			items: make(map[int]*semanticStreamItem),
+		},
+	}
+	reqCtx.Routing.SelectRecipe(&config.RoutingRecipe{Name: config.DefaultRecipeName})
+
+	// Large uncompressed synthesis prompt (80000+ bytes, ~20000+ tokens)
+	largeText := "HEAD instruction\n" + strings.Repeat(" a", 40000) + "\nTAIL instruction"
+	rawSynthesisBody := []byte(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}]}`, model, largeText))
+
+	initialSignals := extractSemanticRequestSignals(&llmprotocol.Request{
+		Messages: []llmprotocol.Message{
+			{Role: "user", Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: largeText}}},
+		},
+	})
+	uncompressedPromptTokens := initialSignals.ContextTokenFloor
+	require.GreaterOrEqual(t, uncompressedPromptTokens, 10000)
+
+	// Call buildLooperStreamingDispatchResponse
+	resp, synthesisTextBytes, err := router.buildLooperStreamingDispatchResponse(
+		rawSynthesisBody, model, decision, reqCtx,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	// Compression should have run
+	require.True(t, reqCtx.ContextCompressionApplied)
+	require.Greater(t, reqCtx.ContextCompressionBefore, reqCtx.ContextCompressionAfter)
+
+	// LooperSynthesisPromptTokens must reflect the post-compression prompt tokens floor
+	compressedPromptTokens := reqCtx.LooperSynthesisPromptTokens
+	require.Greater(t, compressedPromptTokens, 0)
+	require.Less(t, compressedPromptTokens, uncompressedPromptTokens,
+		"LooperSynthesisPromptTokens must reflect compressed tokens, not uncompressed initial tokens")
+
+	reqCtx.LooperTargetModel = model
+	reqCtx.LooperSynthesisTextBytes = synthesisTextBytes
+	router.startRouterReplay(reqCtx, "virtual-entrypoint", model, decision.Name)
+	require.NotEmpty(t, reqCtx.RouterReplayID)
+
+	// Downstream output chunks arrive without usage tail frame
+	chunkText := "Streaming output tokens from judge model before abort."
+	expectedEstimatedOutput := contextcompression.EstimateTokens(chunkText)
+	require.Greater(t, expectedEstimatedOutput, 0)
+
+	observeProtocolStream(reqCtx, []llmprotocol.Event{
+		{
+			Type:      llmprotocol.EventOutputTextDelta,
+			ItemIndex: 0,
+			Delta:     chunkText,
+		},
+	}, nil)
+
+	// Client cancels stream before done/usage frame
+	err = router.handleProcessReceiveError(reqCtx, context.Canceled)
+	require.NoError(t, err)
+	require.True(t, reqCtx.StreamingAborted)
+	require.True(t, reqCtx.LooperUsageSettled)
+
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, routerreplay.LifecycleAborted, record.LifecycleState)
+	require.Equal(t, "client_canceled", record.TerminalReason)
+	require.NotNil(t, record.PromptTokens)
+	require.NotNil(t, record.CompletionTokens)
+	require.NotNil(t, record.TotalTokens)
+
+	// Prompt tokens: 20 intermediate + compressedPromptTokens.
+	// Must NOT equal 20 + uncompressedPromptTokens.
+	require.Equal(t, 20+compressedPromptTokens, *record.PromptTokens,
+		"settled prompt tokens must reflect post-compression tokens floor")
+	require.NotEqual(t, 20+uncompressedPromptTokens, *record.PromptTokens,
+		"settled prompt tokens must not reflect pre-compression tokens floor")
+	require.Equal(t, 10+expectedEstimatedOutput, *record.CompletionTokens)
+	require.Equal(t, 20+compressedPromptTokens+10+expectedEstimatedOutput, *record.TotalTokens)
+}
+
+func TestLooperStreaming_SynthesisTextBytesReflectsPostCompression(t *testing.T) {
+	router, model := routingTestRouterForFormat(llmprotocol.OpenAIChatV1)
+	router.Config.DefaultModel = "virtual-entrypoint"
+	router.Config.CandidateRequirements = &config.CandidateRequirements{
+		Capabilities: config.CandidateCapabilitiesDeclared,
+		Context:      config.CandidateContextKnownLimits,
+	}
+	params := router.Config.ModelConfig[model]
+	params.Capabilities = []string{"chat"}
+	params.ContextWindowSize = 32768
+	params.MaxOutputTokens = 8192
+	router.Config.ModelConfig[model] = params
+
+	payload, err := config.NewStructuredPayload(map[string]any{
+		"enabled": true,
+		"targets": map[string]any{
+			"current_user": map[string]any{"mode": "truncate"},
+			"history":      map[string]any{"mode": "extractive", "min_tokens": 2000, "target_tokens": 1000},
+			"tool_outputs": map[string]any{"mode": "preserve"},
+		},
+	})
+	require.NoError(t, err)
+
+	decision := &config.Decision{
+		Name:      "fusion-compression-decision",
+		ModelRefs: []config.ModelRef{{Model: model}},
+		Algorithm: &config.AlgorithmConfig{
+			Type: config.DecisionAlgorithmFusion,
+			Fusion: &config.FusionAlgorithmConfig{
+				Model: model,
+			},
+		},
+		Plugins: []config.DecisionPlugin{
+			{Type: "context_compression", Configuration: payload},
+		},
+	}
+	router.Config.Decisions = []config.Decision{*decision}
+	router.Config.Signals.ContextRules = []config.ContextRule{{
+		Name:      "window",
+		MinTokens: config.TokenCount("100K"),
+	}}
+
+	classifier, err := classification.BuildClassifier(router.Config, nil, nil, nil)
+	require.NoError(t, err)
+	router.Classifier = classifier
+
+	clientReq := &llmprotocol.Request{
+		Model: "client-entrypoint",
+		Messages: []llmprotocol.Message{
+			{Role: "user", Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: "original client query"}}},
+		},
+	}
+	reqCtx := &RequestContext{
+		RequestID:               "req-stream-compress-test",
+		SourceFormat:            llmprotocol.OpenAIChatV1,
+		SemanticRequest:         clientReq,
+		VSRSelectedDecision:     decision,
+		VSRSelectedDecisionName: decision.Name,
+		TraceContext:            context.Background(),
+		ExpectStreamingResponse: true,
+	}
+	reqCtx.Routing.SelectRecipe(&config.RoutingRecipe{Name: config.DefaultRecipeName})
+
+	// 80000+ bytes uncompressed synthesis prompt
+	largeText := "HEAD instruction\n" + strings.Repeat(" a", 40000) + "\nTAIL instruction"
+	rawSynthesisBody := []byte(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}]}`, model, largeText))
+
+	initialSignals := extractSemanticRequestSignals(&llmprotocol.Request{
+		Messages: []llmprotocol.Message{
+			{Role: "user", Content: []llmprotocol.Content{{Kind: llmprotocol.ContentText, Text: largeText}}},
+		},
+	})
+	initialBytes := initialSignals.ContextTextBytes
+	require.GreaterOrEqual(t, initialBytes, 8000, "initial uncompressed bytes should be at least 8000")
+
+	// Call buildLooperStreamingDispatchResponse
+	resp, synthesisTextBytes, err := router.buildLooperStreamingDispatchResponse(
+		rawSynthesisBody, model, decision, reqCtx,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	// Context compression must have been applied during prepareProviderDispatch
+	require.True(t, reqCtx.ContextCompressionApplied)
+	require.Greater(t, reqCtx.ContextCompressionBefore, reqCtx.ContextCompressionAfter)
+
+	// synthesisTextBytes must reflect the post-compression bytes, NOT the uncompressed 8000+ bytes!
+	require.Less(t, synthesisTextBytes, initialBytes, "synthesisTextBytes must be strictly less than uncompressed bytes")
+
+	// Verify that the dispatched outbound body text length matches synthesisTextBytes exactly
+	engine, err := router.protocolEngine()
+	require.NoError(t, err)
+	outboundBody := resp.GetRequestBody().GetResponse().GetBodyMutation().GetBody()
+	decodedReq, _, _, err := engine.DecodeRequest(llmprotocol.OpenAIChatV1, outboundBody)
+	require.NoError(t, err)
+	outboundTextBytes := extractSemanticRequestSignals(&decodedReq).ContextTextBytes
+	require.Equal(t, outboundTextBytes, synthesisTextBytes, "synthesisTextBytes must exactly match the outbound dispatched payload")
+
+	// Verify reqCtx.LooperSynthesisTextBytes reflects the post-compression bytes
+	reqCtx.LooperTargetModel = model
+	reqCtx.LooperStreamingActive = true
+	reqCtx.LooperSynthesisTextBytes = synthesisTextBytes
+	require.Equal(t, synthesisTextBytes, reqCtx.LooperSynthesisTextBytes)
+	require.Less(t, reqCtx.LooperSynthesisTextBytes, initialBytes)
+
+	// Verify reqCtx.LooperSynthesisPromptTokens reflects the post-compression ContextTokenFloor
+	outboundSignals := extractSemanticRequestSignals(&decodedReq)
+	require.Equal(t, outboundSignals.ContextTokenFloor, reqCtx.LooperSynthesisPromptTokens, "LooperSynthesisPromptTokens must reflect post-compression prompt tokens")
+	require.Less(t, reqCtx.LooperSynthesisPromptTokens, initialSignals.ContextTokenFloor, "LooperSynthesisPromptTokens must be strictly less than initial uncompressed tokens")
+
+	// Verify client SemanticRequest was preserved and restored
+	require.Same(t, clientReq, reqCtx.SemanticRequest, "client SemanticRequest must be restored after dispatch response building")
+
+	// Verify calibration: upstream returns prompt_tokens corresponding to the compressed size (~4 bytes/token)
+	actualTokens := synthesisTextBytes / 4
+	for i := 0; i < 10; i++ {
+		router.calibrateTokenEstimatorForModel(reqCtx, model, streamingCalibrationByteLen(reqCtx), actualTokens)
+	}
+
+	calibratedClassifier := router.classifierForRequest(reqCtx)
+	require.NotNil(t, calibratedClassifier)
+	mean, _, samples, calibrated := calibratedClassifier.TokenCalibrationRatio("model:" + model)
+	require.True(t, calibrated)
+	require.Equal(t, int64(10), samples)
+	expectedRatio := float64(synthesisTextBytes) / float64(actualTokens)
+	require.InDelta(t, expectedRatio, mean, 0.01)
+	require.Less(t, mean, 10.0, "calibrator ratio must not be poisoned by uncompressed bytes")
+}
+
+func TestLooperStreaming_PrepareDeadlineExceededYields504(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqPayload struct {
+			Model string `json:"model"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&reqPayload))
+		writeFusionReplayCompletion(w, reqPayload.Model, []map[string]interface{}{{
+			"index": 0,
+			"message": map[string]interface{}{
+				"role":    "assistant",
+				"content": "Panel answer from " + reqPayload.Model,
+			},
+			"finish_reason": "stop",
+		}}, map[string]int64{"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140})
+	}))
+	defer server.Close()
+
+	streamRouter, streamReqCtx, protoReq := quorumFallbackRouter(server.URL)
+	streamRouter.Config.ClearRouteCache = true
+	streamReqCtx.ExpectStreamingResponse = true
+	protoReq.Stream = true
+
+	streamDecision := &config.Decision{
+		Name: "fusion-stream-prepare-timeout",
+		Algorithm: &config.AlgorithmConfig{
+			Type: config.DecisionAlgorithmFusion,
+			Fusion: &config.FusionAlgorithmConfig{
+				Model:          "judge",
+				AnalysisModels: []string{"panel-a"},
+				AnalysisMode:   config.FusionAnalysisModeOneCall,
+			},
+		},
+	}
+	streamReqCtx.VSRSelectedDecision = streamDecision
+
+	looperReq, errResp := streamRouter.buildLooperRequest(protoReq, streamDecision, streamReqCtx)
+	require.Nil(t, errResp)
+	require.NotNil(t, looperReq)
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-100*time.Millisecond))
+	defer cancel()
+
+	streamResp, err := streamRouter.handleLooperStreamingDispatch(ctx, looperReq, streamDecision, protoReq.Model, streamReqCtx)
+	require.NoError(t, err)
+	require.NotNil(t, streamResp)
+	require.NotNil(t, streamResp.GetImmediateResponse())
+	require.Equal(t, int32(504), int32(streamResp.GetImmediateResponse().GetStatus().GetCode()))
+
+	require.NotNil(t, streamReqCtx.ImmediateProtocolError)
+	require.Equal(t, llmprotocol.ErrorUpstreamTimeout, streamReqCtx.ImmediateProtocolError.Category)
+	require.Equal(t, "request_timeout", streamReqCtx.ImmediateProtocolError.Code)
+
+	record, ok := streamRouter.ReplayRecorder.GetRecord(streamReqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, 504, record.ResponseStatus)
+	require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+	require.Equal(t, "looper_streaming_deadline_exceeded", record.TerminalReason)
+}
+
+func TestLooperStreaming_DispatchDeadlineExceededYields504(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqPayload struct {
+			Model string `json:"model"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&reqPayload))
+		writeFusionReplayCompletion(w, reqPayload.Model, []map[string]interface{}{{
+			"index": 0,
+			"message": map[string]interface{}{
+				"role":    "assistant",
+				"content": "Panel answer from " + reqPayload.Model,
+			},
+			"finish_reason": "stop",
+		}}, map[string]int64{"prompt_tokens": 120, "completion_tokens": 45, "total_tokens": 165})
+	}))
+	defer server.Close()
+
+	streamRouter, streamReqCtx, protoReq := quorumFallbackRouter(server.URL)
+	streamRouter.Config.ClearRouteCache = true
+	streamReqCtx.ExpectStreamingResponse = true
+	protoReq.Stream = true
+
+	streamDecision := &config.Decision{
+		Name: "fusion-stream-dispatch-timeout",
+		Algorithm: &config.AlgorithmConfig{
+			Type: config.DecisionAlgorithmFusion,
+			Fusion: &config.FusionAlgorithmConfig{
+				Model:          "judge",
+				AnalysisModels: []string{"panel-a"},
+				AnalysisMode:   config.FusionAnalysisModeOneCall,
+			},
+		},
+	}
+	streamReqCtx.VSRSelectedDecision = streamDecision
+
+	looperReq, errResp := streamRouter.buildLooperRequest(protoReq, streamDecision, streamReqCtx)
+	require.Nil(t, errResp)
+	require.NotNil(t, looperReq)
+
+	// Set expired TraceContext so prepare succeeds but dispatch fails with DeadlineExceeded
+	traceCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-100*time.Millisecond))
+	defer cancel()
+	streamReqCtx.TraceContext = traceCtx
+
+	streamResp, err := streamRouter.handleLooperStreamingDispatch(context.Background(), looperReq, streamDecision, protoReq.Model, streamReqCtx)
+	require.NoError(t, err)
+	require.NotNil(t, streamResp)
+	require.NotNil(t, streamResp.GetImmediateResponse())
+	require.Equal(t, int32(504), int32(streamResp.GetImmediateResponse().GetStatus().GetCode()))
+
+	require.NotNil(t, streamReqCtx.ImmediateProtocolError)
+	require.Equal(t, llmprotocol.ErrorUpstreamTimeout, streamReqCtx.ImmediateProtocolError.Category)
+	require.Equal(t, "request_timeout", streamReqCtx.ImmediateProtocolError.Code)
+
+	record, ok := streamRouter.ReplayRecorder.GetRecord(streamReqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, 504, record.ResponseStatus)
+	require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+	require.Equal(t, "looper_stream_dispatch_deadline_exceeded", record.TerminalReason)
+	require.NotNil(t, record.PromptTokens)
+	require.Equal(t, 120, *record.PromptTokens)
+	require.NotNil(t, record.CompletionTokens)
+	require.Equal(t, 45, *record.CompletionTokens)
+}
+
+func TestLooperStreaming_StageContextExceededYields400(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqPayload struct {
+			Model string `json:"model"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&reqPayload))
+		writeFusionReplayCompletion(w, reqPayload.Model, []map[string]interface{}{{
+			"index": 0,
+			"message": map[string]interface{}{
+				"role":    "assistant",
+				"content": "Panel answer from " + reqPayload.Model,
+			},
+			"finish_reason": "stop",
+		}}, map[string]int64{"prompt_tokens": 120, "completion_tokens": 45, "total_tokens": 165})
+	}))
+	defer server.Close()
+
+	streamRouter, streamReqCtx, protoReq := quorumFallbackRouter(server.URL)
+	streamRouter.Config.ClearRouteCache = true
+	streamReqCtx.ExpectStreamingResponse = true
+	protoReq.Stream = true
+
+	// Set tiny ContextWindowSize on judge so validateLooperStageContext fails during prepare
+	streamRouter.Config.BackendModels.ModelConfig["judge"] = config.ModelParams{
+		Capabilities:      []string{"chat"},
+		ContextWindowSize: 5,
+	}
+
+	streamDecision := &config.Decision{
+		Name: "fusion-stream-stage-context-exceeded",
+		Algorithm: &config.AlgorithmConfig{
+			Type: config.DecisionAlgorithmFusion,
+			Fusion: &config.FusionAlgorithmConfig{
+				Model:          "judge",
+				AnalysisModels: []string{"panel-a"},
+				AnalysisMode:   config.FusionAnalysisModeOneCall,
+			},
+		},
+	}
+	streamReqCtx.VSRSelectedDecision = streamDecision
+	streamReqCtx.VSRContextTokenCount = 100
+
+	looperReq, errResp := streamRouter.buildLooperRequest(protoReq, streamDecision, streamReqCtx)
+	require.Nil(t, errResp)
+	require.NotNil(t, looperReq)
+
+	streamResp, err := streamRouter.handleLooperStreamingDispatch(context.Background(), looperReq, streamDecision, protoReq.Model, streamReqCtx)
+	require.NoError(t, err)
+	require.NotNil(t, streamResp)
+	require.NotNil(t, streamResp.GetImmediateResponse())
+	require.Equal(t, int32(400), int32(streamResp.GetImmediateResponse().GetStatus().GetCode()))
+
+	require.NotNil(t, streamReqCtx.ImmediateProtocolError)
+	require.Equal(t, llmprotocol.ErrorInvalidRequest, streamReqCtx.ImmediateProtocolError.Category)
+	require.Equal(t, "context_length_exceeded", streamReqCtx.ImmediateProtocolError.Code)
+
+	record, ok := streamRouter.ReplayRecorder.GetRecord(streamReqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, 400, record.ResponseStatus)
+	require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+	require.Equal(t, "looper_stage_context_exceeded", record.TerminalReason)
+	require.NotNil(t, record.PromptTokens)
+	require.Equal(t, 120, *record.PromptTokens)
+	require.NotNil(t, record.CompletionTokens)
+	require.Equal(t, 45, *record.CompletionTokens)
+}
+
+func TestLooperStreaming_BudgetExhaustedYields400(t *testing.T) {
+	t.Run("zero_budget_fails_closed_immediately", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var reqPayload struct {
+				Model string `json:"model"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&reqPayload))
+			writeFusionReplayCompletion(w, reqPayload.Model, []map[string]interface{}{{
+				"index": 0,
+				"message": map[string]interface{}{
+					"role":    "assistant",
+					"content": "Panel answer from " + reqPayload.Model,
+				},
+				"finish_reason": "stop",
+			}}, map[string]int64{"prompt_tokens": 120, "completion_tokens": 45, "total_tokens": 165})
+		}))
+		defer server.Close()
+
+		streamRouter, streamReqCtx, protoReq := quorumFallbackRouter(server.URL)
+		streamRouter.Config.ClearRouteCache = true
+		streamReqCtx.ExpectStreamingResponse = true
+		protoReq.Stream = true
+
+		streamDecision := &config.Decision{
+			Name: "fusion-stream-budget-exhausted-zero",
+			Algorithm: &config.AlgorithmConfig{
+				Type: config.DecisionAlgorithmFusion,
+				Fusion: &config.FusionAlgorithmConfig{
+					Model:          "judge",
+					AnalysisModels: []string{"panel-a"},
+					AnalysisMode:   config.FusionAnalysisModeOneCall,
+				},
+			},
+		}
+		streamReqCtx.VSRSelectedDecision = streamDecision
+
+		looperReq, errResp := streamRouter.buildLooperRequest(protoReq, streamDecision, streamReqCtx)
+		require.Nil(t, errResp)
+		require.NotNil(t, looperReq)
+
+		// Install a budget ledger with 0 limit so first call triggers budget.ErrExhausted
+		ctx, _ := budget.WithLimit(context.Background(), 0)
+
+		streamResp, err := streamRouter.handleLooperStreamingDispatch(ctx, looperReq, streamDecision, protoReq.Model, streamReqCtx)
+		require.NoError(t, err)
+		require.NotNil(t, streamResp)
+		require.NotNil(t, streamResp.GetImmediateResponse())
+		require.Equal(t, int32(400), int32(streamResp.GetImmediateResponse().GetStatus().GetCode()))
+
+		require.NotNil(t, streamReqCtx.ImmediateProtocolError)
+		require.Equal(t, llmprotocol.ErrorInvalidRequest, streamReqCtx.ImmediateProtocolError.Category)
+		require.Equal(t, "budget_exhausted", streamReqCtx.ImmediateProtocolError.Code)
+
+		record, ok := streamRouter.ReplayRecorder.GetRecord(streamReqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, 400, record.ResponseStatus)
+		require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+		require.Equal(t, "looper_budget_exhausted", record.TerminalReason)
+	})
+
+	t.Run("exhausted_budget_after_prepare_fails_closed_reserving_final_leg", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var reqPayload struct {
+				Model string `json:"model"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&reqPayload))
+			writeFusionReplayCompletion(w, reqPayload.Model, []map[string]interface{}{{
+				"index": 0,
+				"message": map[string]interface{}{
+					"role":    "assistant",
+					"content": "Panel answer from " + reqPayload.Model,
+				},
+				"finish_reason": "stop",
+			}}, map[string]int64{"prompt_tokens": 120, "completion_tokens": 45, "total_tokens": 165})
+		}))
+		defer server.Close()
+
+		streamRouter, streamReqCtx, protoReq := quorumFallbackRouter(server.URL)
+		streamRouter.Config.ClearRouteCache = true
+		streamReqCtx.ExpectStreamingResponse = true
+		protoReq.Stream = true
+
+		// Set budget to 1 call. The intermediate panel analysis spends that 1 call.
+		// No quota remains for the final Envoy synthesis call (Remaining < 1),
+		// so streaming dispatch must fail-closed with 400 budget exhausted.
+		streamDecision := &config.Decision{
+			Name: "fusion-stream-budget-exhausted-after-prepare",
+			Algorithm: &config.AlgorithmConfig{
+				Type: config.DecisionAlgorithmFusion,
+				Budget: &config.AlgorithmBudget{
+					MaxCalls: 1,
+				},
+				Fusion: &config.FusionAlgorithmConfig{
+					Model:          "judge",
+					AnalysisModels: []string{"panel-a"},
+					AnalysisMode:   config.FusionAnalysisModeOneCall,
+				},
+			},
+		}
+		streamReqCtx.VSRSelectedDecision = streamDecision
+
+		looperReq, errResp := streamRouter.buildLooperRequest(protoReq, streamDecision, streamReqCtx)
+		require.Nil(t, errResp)
+		require.NotNil(t, looperReq)
+
+		streamResp, err := streamRouter.handleLooperStreamingDispatch(context.Background(), looperReq, streamDecision, protoReq.Model, streamReqCtx)
+		require.NoError(t, err)
+		require.NotNil(t, streamResp)
+		require.NotNil(t, streamResp.GetImmediateResponse())
+		require.Equal(t, int32(400), int32(streamResp.GetImmediateResponse().GetStatus().GetCode()))
+
+		require.NotNil(t, streamReqCtx.ImmediateProtocolError)
+		require.Equal(t, llmprotocol.ErrorInvalidRequest, streamReqCtx.ImmediateProtocolError.Category)
+		require.Equal(t, "budget_exhausted", streamReqCtx.ImmediateProtocolError.Code)
+
+		record, ok := streamRouter.ReplayRecorder.GetRecord(streamReqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, 400, record.ResponseStatus)
+		require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+		require.Equal(t, "looper_budget_exhausted", record.TerminalReason)
+	})
+}
+
+func TestLooperStreaming_PanicDuringDispatchConstructionSettlesIntermediateTokens(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Model string `json:"model"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		writeFusionReplayCompletion(w, request.Model, []map[string]interface{}{{
+			"index": 0,
+			"message": map[string]interface{}{
+				"role":    "assistant",
+				"content": "Panel answer from " + request.Model,
+			},
+			"finish_reason": "stop",
+		}}, map[string]int64{"prompt_tokens": 24, "completion_tokens": 12, "total_tokens": 36})
+	}))
+	defer server.Close()
+
+	router, reqCtx, request := quorumFallbackRouter(server.URL)
+	router.Config.ClearRouteCache = true
+	reqCtx.ExpectStreamingResponse = true
+	request.Stream = true
+
+	decision := &config.Decision{
+		Name: "fusion-stream-dispatch-panic",
+		Algorithm: &config.AlgorithmConfig{
+			Type: config.DecisionAlgorithmFusion,
+			Fusion: &config.FusionAlgorithmConfig{
+				Model:          "judge",
+				AnalysisModels: []string{"panel-a", "panel-b"},
+				AnalysisMode:   config.FusionAnalysisModeOneCall,
+			},
+		},
+	}
+	reqCtx.VSRSelectedDecision = decision
+	reqCtx.VSRSelectedDecisionName = decision.Name
+
+	// Wrap execution and simulate a panic during dispatch response construction:
+	// Once PrepareStreamingSynthesis succeeds, intermediate tokens are mounted immediately on reqCtx.
+	// Even if a subsequent panic occurs during dispatch, the outer recover guard must settle the tokens to Replay.
+	var recoveredPanic any
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				recoveredPanic = rec
+				if reqCtx != nil {
+					router.settleAbortedLooperStreamingUsage(reqCtx, fmt.Errorf("processor_panic: %v", rec))
+				}
+				router.finalizeRouterReplay(reqCtx, routerreplay.LifecycleFailed, "processor_panic")
+			}
+		}()
+
+		looperReq, errResp := router.buildLooperRequest(request, decision, reqCtx)
+		require.Nil(t, errResp)
+
+		runtimeConfig := router.Config.Looper
+		hops := router.looperHops()
+		require.NotNil(t, hops)
+		client := looper.NewHopClient(&runtimeConfig, hops)
+		looperInstance, err := looper.FactoryWithClientAndWorkflowState(&runtimeConfig, decision.Algorithm.Type, client, router.WorkflowStateService)
+		require.NoError(t, err)
+
+		streamingLooper, ok := looperInstance.(looper.StreamingLooper)
+		require.True(t, ok)
+
+		plan, err := streamingLooper.PrepareStreamingSynthesis(context.Background(), looperReq)
+		require.NoError(t, err)
+
+		// Verify immediate mounting before dispatch building
+		reqCtx.LooperIntermediateUsage = plan.IntermediateUsage
+		reqCtx.LooperModelsUsed = plan.ModelsUsed
+		reqCtx.LooperIterations = plan.Iterations
+		reqCtx.LooperTrace = plan.Trace
+		reqCtx.LooperStreamingActive = true
+
+		// Simulate panic during dispatch building (e.g. OOM or serialization panic)
+		panic("simulated panic during streaming dispatch serialization")
+	}()
+
+	require.NotNil(t, recoveredPanic)
+	require.Equal(t, "simulated panic during streaming dispatch serialization", recoveredPanic)
+	require.True(t, reqCtx.LooperUsageSettled)
+	require.True(t, reqCtx.StreamingAborted)
+
+	// Verify replay record exists and holds intermediate token usage with LifecycleFailed and processor_panic
+	record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+	require.Equal(t, "processor_panic", record.TerminalReason)
+	require.NotNil(t, record.PromptTokens)
+	require.NotNil(t, record.CompletionTokens)
+	require.NotNil(t, record.TotalTokens)
+	require.Equal(t, 48, *record.PromptTokens)
+	require.Equal(t, 24, *record.CompletionTokens)
+	require.Equal(t, 72, *record.TotalTokens)
+}
+
+func TestLooperStreaming_PanicDuringResponseStreamProcessingSettlesTokens(t *testing.T) {
+	memStore := store.NewMemoryStore(10, 0)
+	recorder := routerreplay.NewRecorder(memStore)
+	replayConfig := config.DefaultRouterReplayPluginConfig()
+	router := &OpenAIRouter{
+		Config: &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{
+				Enabled: true,
+			},
+		},
+		ReplayRecorder: recorder,
+	}
+
+	reqCtx := &RequestContext{
+		RequestID:                 "req-stream-panic-response",
+		RequestModel:              "client-model",
+		VSRSelectedModel:          "judge",
+		LooperTargetModel:         "judge",
+		VSRSelectedDecisionName:   "fusion-stream",
+		RouterReplayRecorder:      recorder,
+		RouterReplayPluginConfig:  &replayConfig,
+		IsStreamingResponse:       true,
+		StreamingComplete:         false,
+		LooperStreamingActive:     true,
+		LooperAuditedOutputTokens: 10,
+		LooperIntermediateUsage: looper.TokenUsage{
+			PromptTokens:     45,
+			CompletionTokens: 15,
+			TotalTokens:      60,
+		},
+	}
+
+	router.startRouterReplay(reqCtx, "client-model", "judge", "fusion-stream")
+	require.NotEmpty(t, reqCtx.RouterReplayID)
+
+	// Simulate panic during downstream SSE response stream processing
+	var recoveredPanic any
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				recoveredPanic = rec
+				if reqCtx != nil {
+					router.settleAbortedLooperStreamingUsage(reqCtx, fmt.Errorf("processor_panic: %v", rec))
+				}
+				router.finalizeRouterReplay(reqCtx, routerreplay.LifecycleFailed, "processor_panic")
+			}
+		}()
+		panic("downstream SSE chunk processing panic")
+	}()
+
+	require.NotNil(t, recoveredPanic)
+	require.True(t, reqCtx.StreamingAborted)
+	require.True(t, reqCtx.LooperUsageSettled)
+
+	record, ok := recorder.GetRecord(reqCtx.RouterReplayID)
+	require.True(t, ok)
+	require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+	require.Equal(t, "processor_panic", record.TerminalReason)
+	require.NotNil(t, record.PromptTokens)
+	require.NotNil(t, record.CompletionTokens)
+	require.NotNil(t, record.TotalTokens)
+	require.Equal(t, 45, *record.PromptTokens)
+	require.Equal(t, 25, *record.CompletionTokens) // 15 intermediate + 10 audited output tokens
+	require.Equal(t, 70, *record.TotalTokens)
+}
+
+type looperStreamingPanicMockStream struct {
+	MockStream
+	panicOnResponseBody bool
+	panicOnRequestBody  bool
+	panicMsg            string
+}
+
+func (s *looperStreamingPanicMockStream) Send(resp *ext_proc.ProcessingResponse) error {
+	if s.panicOnRequestBody && resp.GetRequestBody() != nil {
+		panic(s.panicMsg)
+	}
+	if s.panicOnResponseBody && resp.GetResponseBody() != nil {
+		panic(s.panicMsg)
+	}
+	return s.MockStream.Send(resp)
+}
+
+func TestLooperStreaming_ProcessRealEntrypointPanicSettlesIntermediateTokens(t *testing.T) {
+	newFixture := func(t *testing.T) (*httptest.Server, *OpenAIRouter, *store.MemoryStore) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var request struct {
+				Model string `json:"model"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+			writeFusionReplayCompletion(w, request.Model, []map[string]interface{}{{
+				"index": 0,
+				"message": map[string]interface{}{
+					"role":    "assistant",
+					"content": "Panel answer from " + request.Model,
+				},
+				"finish_reason": "stop",
+			}}, map[string]int64{"prompt_tokens": 24, "completion_tokens": 12, "total_tokens": 36})
+		}))
+
+		memStore := store.NewMemoryStore(10, 0)
+		recorder := routerreplay.NewRecorder(memStore)
+
+		decision := &config.Decision{
+			Name: "fusion-stream-dispatch-panic",
+			Algorithm: &config.AlgorithmConfig{
+				Type: config.DecisionAlgorithmFusion,
+				Fusion: &config.FusionAlgorithmConfig{
+					Model:          "judge",
+					AnalysisModels: []string{"panel-a", "panel-b"},
+					AnalysisMode:   config.FusionAnalysisModeOneCall,
+				},
+			},
+		}
+
+		routerCfg := &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{
+				Enabled: true,
+			},
+			Looper: config.LooperConfig{
+				Endpoint: server.URL,
+			},
+			BackendModels: config.BackendModels{
+				ModelConfig: map[string]config.ModelParams{
+					"panel-a": {Capabilities: []string{"chat"}},
+					"panel-b": {Capabilities: []string{"chat"}},
+					"judge":   {Capabilities: []string{"chat"}},
+				},
+			},
+			Recipes: []config.RoutingRecipe{
+				{
+					Name: config.DefaultRecipeName,
+					Profile: config.RoutingProfile{
+						Decisions: []config.Decision{*decision},
+					},
+				},
+			},
+		}
+
+		classifier, err := classification.BuildClassifier(routerCfg, nil, nil, nil)
+		require.NoError(t, err)
+
+		router := &OpenAIRouter{
+			Config:         routerCfg,
+			Classifier:     classifier,
+			ReplayRecorder: recorder,
+		}
+
+		return server, router, memStore
+	}
+
+	t.Run("panic during request body dispatch handle settles tokens", func(t *testing.T) {
+		server, router, memStore := newFixture(t)
+		defer server.Close()
+
+		headersReq := &ext_proc.ProcessingRequest{
+			Request: &ext_proc.ProcessingRequest_RequestHeaders{
+				RequestHeaders: &ext_proc.HttpHeaders{
+					Headers: &core.HeaderMap{
+						Headers: []*core.HeaderValue{
+							{Key: "content-type", Value: "application/json"},
+							{Key: "x-request-id", Value: "req-e2e-panic-dispatch"},
+						},
+					},
+				},
+			},
+		}
+		bodyReq := &ext_proc.ProcessingRequest{
+			Request: &ext_proc.ProcessingRequest_RequestBody{
+				RequestBody: &ext_proc.HttpBody{
+					Body:        []byte(`{"model":"vllm-sr/auto","messages":[{"role":"user","content":"hello"}],"stream":true}`),
+					EndOfStream: true,
+				},
+			},
+		}
+
+		stream := &looperStreamingPanicMockStream{
+			MockStream: *NewMockStream([]*ext_proc.ProcessingRequest{
+				headersReq,
+				bodyReq,
+			}),
+			panicOnRequestBody: true,
+			panicMsg:           "simulated dispatch phase panic",
+		}
+
+		// Call production Process entrypoint directly without manual recover
+		err := router.Process(stream)
+		require.Error(t, err)
+
+		st, ok := status.FromError(err)
+		require.True(t, ok)
+		require.Equal(t, codes.Internal, st.Code())
+		require.Contains(t, st.Message(), "simulated dispatch phase panic")
+
+		// Assert Replay record captured intermediate tokens and marked LifecycleFailed with processor_panic
+		records, err := memStore.List(context.Background())
+		require.NoError(t, err)
+		require.Len(t, records, 1)
+
+		record := records[0]
+		require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+		require.Equal(t, "processor_panic", record.TerminalReason)
+		require.NotNil(t, record.PromptTokens)
+		require.NotNil(t, record.CompletionTokens)
+		require.NotNil(t, record.TotalTokens)
+		require.Equal(t, 48, *record.PromptTokens)
+		require.Equal(t, 24, *record.CompletionTokens)
+		require.Equal(t, 72, *record.TotalTokens)
+	})
+
+	t.Run("panic during response body streaming handle settles tokens", func(t *testing.T) {
+		server, router, memStore := newFixture(t)
+		defer server.Close()
+
+		headersReq := &ext_proc.ProcessingRequest{
+			Request: &ext_proc.ProcessingRequest_RequestHeaders{
+				RequestHeaders: &ext_proc.HttpHeaders{
+					Headers: &core.HeaderMap{
+						Headers: []*core.HeaderValue{
+							{Key: "content-type", Value: "application/json"},
+							{Key: "x-request-id", Value: "req-e2e-panic-stream"},
+						},
+					},
+				},
+			},
+		}
+		bodyReq := &ext_proc.ProcessingRequest{
+			Request: &ext_proc.ProcessingRequest_RequestBody{
+				RequestBody: &ext_proc.HttpBody{
+					Body:        []byte(`{"model":"vllm-sr/auto","messages":[{"role":"user","content":"hello"}],"stream":true}`),
+					EndOfStream: true,
+				},
+			},
+		}
+		respHeadersReq := &ext_proc.ProcessingRequest{
+			Request: &ext_proc.ProcessingRequest_ResponseHeaders{
+				ResponseHeaders: &ext_proc.HttpHeaders{
+					Headers: &core.HeaderMap{
+						Headers: []*core.HeaderValue{
+							{Key: "content-type", Value: "text/event-stream"},
+							{Key: ":status", Value: "200"},
+						},
+					},
+				},
+			},
+		}
+		respBodyReq := &ext_proc.ProcessingRequest{
+			Request: &ext_proc.ProcessingRequest_ResponseBody{
+				ResponseBody: &ext_proc.HttpBody{
+					Body:        []byte("data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"judge\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial answer\"}}]}\n\n"),
+					EndOfStream: false,
+				},
+			},
+		}
+
+		stream := &looperStreamingPanicMockStream{
+			MockStream: *NewMockStream([]*ext_proc.ProcessingRequest{
+				headersReq,
+				bodyReq,
+				respHeadersReq,
+				respBodyReq,
+			}),
+			panicOnResponseBody: true,
+			panicMsg:            "simulated response chunk panic",
+		}
+
+		// Call production Process entrypoint directly without manual recover
+		err := router.Process(stream)
+		require.Error(t, err)
+
+		st, ok := status.FromError(err)
+		require.True(t, ok)
+		require.Equal(t, codes.Internal, st.Code())
+		require.Contains(t, st.Message(), "simulated response chunk panic")
+
+		// Assert Replay record captured intermediate tokens plus estimated chunk tokens
+		records, err := memStore.List(context.Background())
+		require.NoError(t, err)
+		require.Len(t, records, 1)
+
+		record := records[0]
+		require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+		require.Equal(t, "processor_panic", record.TerminalReason)
+		require.NotNil(t, record.PromptTokens)
+		require.NotNil(t, record.CompletionTokens)
+		require.NotNil(t, record.TotalTokens)
+		require.GreaterOrEqual(t, *record.PromptTokens, 48)
+		require.GreaterOrEqual(t, *record.CompletionTokens, 24)
+		require.Equal(t, *record.PromptTokens+*record.CompletionTokens, *record.TotalTokens)
+	})
+}
+
+func TestLooperStreaming_QuorumFallbackResponsePhaseFinalization(t *testing.T) {
+	newQuorumFallbackFixture := func(t *testing.T) (*httptest.Server, *OpenAIRouter, *RequestContext, *config.Decision) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+
+		router, reqCtx, request := quorumFallbackRouter(server.URL)
+		router.Config.ClearRouteCache = true
+		reqCtx.ExpectStreamingResponse = true
+		request.Stream = true
+
+		decision := &config.Decision{
+			Name: "fusion-quorum-fallback-delayed",
+			Algorithm: &config.AlgorithmConfig{
+				Type: config.DecisionAlgorithmFusion,
+				Fusion: &config.FusionAlgorithmConfig{
+					Model:                "judge",
+					AnalysisModels:       []string{"panel-a", "panel-b"},
+					AnalysisMode:         config.FusionAnalysisModeOneCall,
+					QuorumFailurePolicy:  config.FusionQuorumFailurePolicyFallback,
+					QuorumFallbackTarget: "backup-model",
+				},
+			},
+		}
+
+		response, err := router.handleLooperExecution(context.Background(), request, decision, reqCtx)
+		require.NoError(t, err)
+		require.NotNil(t, response)
+		require.Nil(t, response.GetImmediateResponse(), "fallback dispatch must continue to Envoy, not return immediate error")
+		require.True(t, reqCtx.LooperStreamingActive)
+		require.Equal(t, "backup-model", reqCtx.VSRSelectedModel)
+
+		// At dispatch, Quorum outcome MUST be pending and NOT prematurely finalized as fallback_served
+		require.NotNil(t, reqCtx.PendingLooperQuorumOutcome, "PendingLooperQuorumOutcome must be staged during dispatch")
+		require.Equal(t, looper.FusionQuorumFallbackReady, reqCtx.PendingLooperQuorumOutcome.Disposition)
+		require.Nil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must remain unfinalized before response phase")
+
+		return server, router, reqCtx, decision
+	}
+
+	t.Run("streaming response success finalizes fallback_served", func(t *testing.T) {
+		server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+		defer server.Close()
+
+		reqCtx.IsStreamingResponse = true
+		reqCtx.SemanticStreamState = &semanticResponseStreamState{
+			responseID: "resp-stream-ok",
+			model:      "backup-model",
+			stop:       llmprotocol.StopEndTurn,
+			terminal:   true,
+			items: map[int]*semanticStreamItem{
+				0: {completed: true, text: "successful fallback stream answer"},
+			},
+			order: []int{0},
+			usage: llmprotocol.Usage{
+				State: llmprotocol.UsageAvailable,
+				InputTotal: llmprotocol.TokenCount{
+					Value:      replayInt64Ptr(20),
+					Provenance: llmprotocol.UsageAuthoritative,
+				},
+				OutputTotal: llmprotocol.TokenCount{
+					Value:      replayInt64Ptr(10),
+					Provenance: llmprotocol.UsageAuthoritative,
+				},
+				Total: llmprotocol.TokenCount{
+					Value:      replayInt64Ptr(30),
+					Provenance: llmprotocol.UsageAuthoritative,
+				},
+			},
+		}
+
+		router.finalizeSemanticStreamingResponse(reqCtx, nil)
+
+		require.False(t, reqCtx.StreamingAborted)
+		require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after finalization")
+		require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated upon successful response")
+		require.Equal(t, string(looper.FusionQuorumFallbackServed), reqCtx.VSRFusionQuorum.Disposition,
+			"successful delivery must finalize to fallback_served")
+		require.Equal(t, "backup-model", reqCtx.VSRFusionQuorum.FallbackTarget)
+
+		require.NotEmpty(t, reqCtx.RouterReplayID)
+		record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleCompleted, record.LifecycleState)
+		require.Equal(t, "response_complete", record.TerminalReason)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, "fallback_served", record.RouteDiagnostics.FusionQuorum.Disposition)
+	})
+
+	t.Run("streaming response abort finalizes to cancelled instead of fallback_served", func(t *testing.T) {
+		server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+		defer server.Close()
+
+		reqCtx.IsStreamingResponse = true
+		router.settleAbortedLooperStreamingUsage(reqCtx, errors.New("client connection dropped"))
+		router.finalizeRouterReplay(reqCtx, routerreplay.LifecycleAborted, "client_canceled")
+
+		require.True(t, reqCtx.StreamingAborted)
+		require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after abort")
+		require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on abort")
+		require.NotEqual(t, string(looper.FusionQuorumFallbackServed), reqCtx.VSRFusionQuorum.Disposition,
+			"aborted response must NOT be recorded as fallback_served")
+		require.Equal(t, string(looper.FusionQuorumCancelled), reqCtx.VSRFusionQuorum.Disposition)
+
+		require.NotEmpty(t, reqCtx.RouterReplayID)
+		record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleAborted, record.LifecycleState)
+		require.Equal(t, "client_canceled", record.TerminalReason)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, "cancelled", record.RouteDiagnostics.FusionQuorum.Disposition)
+	})
+
+	t.Run("client cancellation aligns replay aborted client_canceled and quorum cancelled", func(t *testing.T) {
+		server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+		defer server.Close()
+
+		reqCtx.IsStreamingResponse = true
+		require.NoError(t, router.handleProcessReceiveError(reqCtx, context.Canceled))
+
+		require.True(t, reqCtx.StreamingAborted)
+		require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after client cancel")
+		require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on client cancel")
+		require.Equal(t, string(looper.FusionQuorumCancelled), reqCtx.VSRFusionQuorum.Disposition)
+
+		require.NotEmpty(t, reqCtx.RouterReplayID)
+		record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleAborted, record.LifecycleState)
+		require.Equal(t, "client_canceled", record.TerminalReason)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, "cancelled", record.RouteDiagnostics.FusionQuorum.Disposition)
+	})
+
+	t.Run("upstream 502 empty body eof aligns replay failed upstream_error_response and quorum response_encode_failed", func(t *testing.T) {
+		server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+		defer server.Close()
+
+		reqCtx.IsStreamingResponse = true
+		reqCtx.UpstreamStatusCode = http.StatusBadGateway
+		require.NoError(t, router.handleProcessReceiveError(reqCtx, io.EOF))
+
+		require.True(t, reqCtx.StreamingAborted)
+		require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after upstream 502 eof")
+		require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on upstream 502 error")
+		require.Equal(t, string(looper.FusionQuorumResponseEncodeFailed), reqCtx.VSRFusionQuorum.Disposition)
+
+		require.NotEmpty(t, reqCtx.RouterReplayID)
+		record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+		require.Equal(t, "upstream_error_response", record.TerminalReason)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, "response_encode_failed", record.RouteDiagnostics.FusionQuorum.Disposition)
+	})
+
+	t.Run("upstream stream missing done aligns replay failed upstream_stream_incomplete and quorum response_encode_failed", func(t *testing.T) {
+		server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+		defer server.Close()
+
+		reqCtx.IsStreamingResponse = true
+		reqCtx.SemanticStreamState = &semanticResponseStreamState{
+			responseID: "resp-stream-incomplete",
+			model:      "backup-model",
+			terminal:   false,
+			items: map[int]*semanticStreamItem{
+				0: {completed: false, text: "partial text"},
+			},
+		}
+
+		router.finalizeSemanticStreamingResponse(reqCtx, errors.New("stream_incomplete: missing [DONE]"))
+
+		require.True(t, reqCtx.StreamingAborted)
+		require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after stream incomplete")
+		require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on stream incomplete")
+		require.Equal(t, string(looper.FusionQuorumResponseEncodeFailed), reqCtx.VSRFusionQuorum.Disposition)
+
+		require.NotEmpty(t, reqCtx.RouterReplayID)
+		record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+		require.Equal(t, "upstream_stream_incomplete", record.TerminalReason)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, "response_encode_failed", record.RouteDiagnostics.FusionQuorum.Disposition)
+	})
+
+	t.Run("internal panic aligns replay failed processor_panic and quorum response_encode_failed", func(t *testing.T) {
+		server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+		defer server.Close()
+
+		reqCtx.IsStreamingResponse = true
+		panicErr := fmt.Errorf("processor_panic: unexpected nil pointer")
+		router.settleAbortedLooperStreamingUsage(reqCtx, panicErr)
+		router.finalizeRouterReplay(reqCtx, routerreplay.LifecycleFailed, "processor_panic")
+
+		require.True(t, reqCtx.StreamingAborted)
+		require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after panic")
+		require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on panic")
+		require.Equal(t, string(looper.FusionQuorumResponseEncodeFailed), reqCtx.VSRFusionQuorum.Disposition)
+
+		require.NotEmpty(t, reqCtx.RouterReplayID)
+		record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+		require.Equal(t, "processor_panic", record.TerminalReason)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, "response_encode_failed", record.RouteDiagnostics.FusionQuorum.Disposition)
+	})
+
+	t.Run("replay fusion quorum update failure logs structured error", func(t *testing.T) {
+		coreObs, observedLogs := observer.New(zapcore.WarnLevel)
+		restoreLogger := zap.ReplaceGlobals(zap.New(coreObs))
+		defer restoreLogger()
+
+		server, _, reqCtx, decision := newQuorumFallbackFixture(t)
+		defer server.Close()
+
+		reqCtx.RouterReplayID = "non-existent-replay-id"
+		finalizeLooperQuorumOutcome(reqCtx, reqCtx.PendingLooperQuorumOutcome, decision, true)
+
+		var found bool
+		for _, entry := range observedLogs.All() {
+			if entry.Message == "router_replay_fusion_quorum_update_failed" {
+				found = true
+				fields := entry.ContextMap()
+				require.Equal(t, reqCtx.RequestID, fields["request_id"])
+				require.Equal(t, "non-existent-replay-id", fields["replay_id"])
+				require.NotEmpty(t, fields["error"])
+				break
+			}
+		}
+		require.True(t, found, "router_replay_fusion_quorum_update_failed error log must be emitted")
+	})
+
+	t.Run("upstream 502 transport error finalizes to response_encode_failed instead of fallback_served", func(t *testing.T) {
+		server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+		defer server.Close()
+
+		reqCtx.UpstreamStatusCode = 502
+		resp := router.handleUpstreamTransportError([]byte(`{"error":{"message":"bad gateway from upstream"}}`), reqCtx)
+		require.NotNil(t, resp)
+
+		require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after transport error")
+		require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on upstream error")
+		require.NotEqual(t, string(looper.FusionQuorumFallbackServed), reqCtx.VSRFusionQuorum.Disposition,
+			"upstream 502 error must NOT be recorded as fallback_served")
+		require.Equal(t, string(looper.FusionQuorumResponseEncodeFailed), reqCtx.VSRFusionQuorum.Disposition)
+
+		require.NotEmpty(t, reqCtx.RouterReplayID)
+		record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, "response_encode_failed", record.RouteDiagnostics.FusionQuorum.Disposition)
+	})
+
+	t.Run("non-streaming 200 response finalizes fallback_served", func(t *testing.T) {
+		server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+		defer server.Close()
+
+		body := []byte(`{
+			"id": "chatcmpl-fallback-200",
+			"object": "chat.completion",
+			"created": 1234567890,
+			"model": "backup-model",
+			"choices": [{
+				"index": 0,
+				"message": {"role": "assistant", "content": "non-streaming fallback answer"},
+				"finish_reason": "stop"
+			}],
+			"usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
+		}`)
+
+		resp := router.handleNonStreamingResponseBody(body, reqCtx, 100*time.Millisecond)
+		require.NotNil(t, resp)
+		require.Nil(t, resp.GetImmediateResponse(), "valid 200 body must continue without immediate error")
+
+		require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after non-streaming completion")
+		require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on 200 completion")
+		require.Equal(t, string(looper.FusionQuorumFallbackServed), reqCtx.VSRFusionQuorum.Disposition,
+			"200 non-streaming completion must finalize to fallback_served")
+	})
+
+	t.Run("non-streaming decode error finalizes to response_encode_failed instead of fallback_served", func(t *testing.T) {
+		server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+		defer server.Close()
+
+		resp := router.handleNonStreamingResponseBody([]byte("not valid json"), reqCtx, 100*time.Millisecond)
+		require.NotNil(t, resp)
+		require.NotNil(t, resp.GetImmediateResponse())
+
+		require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after decode error")
+		require.NotNil(t, reqCtx.VSRFusionQuorum)
+		require.NotEqual(t, string(looper.FusionQuorumFallbackServed), reqCtx.VSRFusionQuorum.Disposition,
+			"decode error must NOT be recorded as fallback_served")
+		require.Equal(t, string(looper.FusionQuorumResponseEncodeFailed), reqCtx.VSRFusionQuorum.Disposition)
+	})
+
+	t.Run("real sse missing done aligns replay failed upstream_stream_incomplete and quorum response_encode_failed", func(t *testing.T) {
+		server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+		defer server.Close()
+
+		reqCtx.IsStreamingResponse = true
+		sseChunk := []byte("data: {\"id\":\"chatcmpl-stream-nodone\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"backup-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial streaming fallback content\"},\"finish_reason\":null}]}\n\n")
+
+		resp := router.handleSemanticStreamingResponseBody(sseChunk, true, reqCtx)
+		require.NotNil(t, resp)
+
+		require.True(t, reqCtx.StreamingAborted)
+		require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after stream incomplete")
+		require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on stream incomplete")
+		require.Equal(t, string(looper.FusionQuorumResponseEncodeFailed), reqCtx.VSRFusionQuorum.Disposition, "missing [DONE] must NEVER be classified as cancelled")
+		require.NotEqual(t, string(looper.FusionQuorumCancelled), reqCtx.VSRFusionQuorum.Disposition)
+
+		require.NotEmpty(t, reqCtx.RouterReplayID)
+		record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+		require.Equal(t, "upstream_stream_incomplete", record.TerminalReason)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, "response_encode_failed", record.RouteDiagnostics.FusionQuorum.Disposition)
+
+		require.True(t, reqCtx.LooperUsageSettled, "usage must be settled")
+		require.Greater(t, reqCtx.LooperAuditedOutputTokens, 0, "partial streamed tokens must be audited/settled")
+	})
+
+	t.Run("real sse malformed chunk aligns replay failed and quorum response_encode_failed", func(t *testing.T) {
+		server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+		defer server.Close()
+
+		reqCtx.IsStreamingResponse = true
+		malformedChunk := []byte("data: {\"id\":\"chatcmpl-stream-broken\",invalid_json\n\n")
+
+		resp := router.handleSemanticStreamingResponseBody(malformedChunk, true, reqCtx)
+		require.NotNil(t, resp)
+
+		require.True(t, reqCtx.StreamingAborted)
+		require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after decode error")
+		require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on decode error")
+		require.Equal(t, string(looper.FusionQuorumResponseEncodeFailed), reqCtx.VSRFusionQuorum.Disposition)
+		require.NotEqual(t, string(looper.FusionQuorumCancelled), reqCtx.VSRFusionQuorum.Disposition)
+
+		require.NotEmpty(t, reqCtx.RouterReplayID)
+		record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, "response_encode_failed", record.RouteDiagnostics.FusionQuorum.Disposition)
+	})
+
+	t.Run("real sse error event chunk aligns quorum response_encode_failed", func(t *testing.T) {
+		server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+		defer server.Close()
+
+		reqCtx.IsStreamingResponse = true
+		errorChunk := []byte("data: {\"error\":{\"message\":\"upstream model overloaded\",\"type\":\"server_error\",\"code\":\"server_error\"}}\n\n")
+
+		resp := router.handleSemanticStreamingResponseBody(errorChunk, true, reqCtx)
+		require.NotNil(t, resp)
+
+		require.True(t, reqCtx.StreamingAborted)
+		require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after error event")
+		require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on error event")
+		require.Equal(t, string(looper.FusionQuorumResponseEncodeFailed), reqCtx.VSRFusionQuorum.Disposition)
+		require.NotEqual(t, string(looper.FusionQuorumCancelled), reqCtx.VSRFusionQuorum.Disposition)
+
+		require.NotEmpty(t, reqCtx.RouterReplayID)
+		record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+		require.True(t, ok)
+		require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, "response_encode_failed", record.RouteDiagnostics.FusionQuorum.Disposition)
+	})
+
+	t.Run("real sse downstream real cancellation aligns replay aborted client_canceled and quorum cancelled", func(t *testing.T) {
+		t.Run("context cancelled", func(t *testing.T) {
+			server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+			defer server.Close()
+
+			reqCtx.IsStreamingResponse = true
+			cancelCtx, cancel := context.WithCancel(context.Background())
+			reqCtx.Context = cancelCtx
+			cancel() // downstream client cancels
+
+			chunk := []byte("data: {\"id\":\"chatcmpl-stream-cancel\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"backup-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"streamed before client disconnect\"},\"finish_reason\":null}]}\n\n")
+
+			resp := router.handleSemanticStreamingResponseBody(chunk, true, reqCtx)
+			require.NotNil(t, resp)
+
+			require.True(t, reqCtx.StreamingAborted)
+			require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after cancellation")
+			require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on cancellation")
+			require.Equal(t, string(looper.FusionQuorumCancelled), reqCtx.VSRFusionQuorum.Disposition)
+
+			require.NotEmpty(t, reqCtx.RouterReplayID)
+			record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+			require.True(t, ok)
+			require.Equal(t, routerreplay.LifecycleAborted, record.LifecycleState)
+			require.Equal(t, "client_canceled", record.TerminalReason)
+			require.NotNil(t, record.RouteDiagnostics)
+			require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+			require.Equal(t, "cancelled", record.RouteDiagnostics.FusionQuorum.Disposition)
+		})
+
+		t.Run("passed context.Canceled", func(t *testing.T) {
+			server, router, reqCtx, _ := newQuorumFallbackFixture(t)
+			defer server.Close()
+
+			reqCtx.IsStreamingResponse = true
+			router.settleAbortedLooperStreamingUsage(reqCtx, context.Canceled)
+			router.finalizeRouterReplay(reqCtx, routerreplay.LifecycleAborted, "client_canceled")
+
+			require.True(t, reqCtx.StreamingAborted)
+			require.Nil(t, reqCtx.PendingLooperQuorumOutcome, "pending outcome must be cleared after cancellation")
+			require.NotNil(t, reqCtx.VSRFusionQuorum, "VSRFusionQuorum must be populated on cancellation")
+			require.Equal(t, string(looper.FusionQuorumCancelled), reqCtx.VSRFusionQuorum.Disposition)
+
+			require.NotEmpty(t, reqCtx.RouterReplayID)
+			record, ok := router.ReplayRecorder.GetRecord(reqCtx.RouterReplayID)
+			require.True(t, ok)
+			require.Equal(t, routerreplay.LifecycleAborted, record.LifecycleState)
+			require.Equal(t, "client_canceled", record.TerminalReason)
+			require.NotNil(t, record.RouteDiagnostics)
+			require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+			require.Equal(t, "cancelled", record.RouteDiagnostics.FusionQuorum.Disposition)
+		})
+	})
+}
+
+func TestLooperStreaming_EnvoyMaxRetriesBudgetClamping(t *testing.T) {
+	newServer := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var reqPayload struct {
+				Model string `json:"model"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&reqPayload))
+			writeFusionReplayCompletion(w, reqPayload.Model, []map[string]interface{}{{
+				"index": 0,
+				"message": map[string]interface{}{
+					"role":    "assistant",
+					"content": "Panel answer from " + reqPayload.Model,
+				},
+				"finish_reason": "stop",
+			}}, map[string]int64{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+		}))
+	}
+
+	t.Run("ample budget (remaining 30) with model configured 1 retry does NOT amplify retries", func(t *testing.T) {
+		server := newServer()
+		defer server.Close()
+
+		router, reqCtx, protoReq := quorumFallbackRouter(server.URL)
+		router.Config.ClearRouteCache = true
+		reqCtx.ExpectStreamingResponse = true
+		protoReq.Stream = true
+
+		modelCfg := router.Config.BackendModels.ModelConfig["judge"]
+		modelCfg.Reliability = config.ProviderReliability{RetryCount: 1}
+		router.Config.BackendModels.ModelConfig["judge"] = modelCfg
+
+		decision := &config.Decision{
+			Name: "fusion-stream-ample-budget",
+			Algorithm: &config.AlgorithmConfig{
+				Type: config.DecisionAlgorithmFusion,
+				Fusion: &config.FusionAlgorithmConfig{
+					Model:          "judge",
+					AnalysisModels: []string{"panel-a"},
+					AnalysisMode:   config.FusionAnalysisModeOneCall,
+				},
+			},
+		}
+		reqCtx.VSRSelectedDecision = decision
+
+		looperReq, errResp := router.buildLooperRequest(protoReq, decision, reqCtx)
+		require.Nil(t, errResp)
+		require.NotNil(t, looperReq)
+
+		// Parent ledger with limit 31: 1 call used by panel-a, 30 remaining
+		execCtx, _ := budget.WithLimit(context.Background(), 31)
+		streamResp, err := router.handleLooperStreamingDispatch(execCtx, looperReq, decision, protoReq.Model, reqCtx)
+		require.NoError(t, err)
+		require.NotNil(t, streamResp)
+		require.Nil(t, streamResp.GetImmediateResponse())
+		require.True(t, reqCtx.LooperStreamingActive)
+		require.Equal(t, 30, reqCtx.LooperRemainingBudget, "remaining budget must be recorded as 30")
+
+		router.addEnvoyReliabilityHeaders(streamResp, reqCtx)
+
+		headers := headerValuesByName(streamResp.GetRequestBody().GetResponse().GetHeaderMutation().GetSetHeaders())
+		require.Equal(t, "1", headers["x-envoy-max-retries"],
+			"x-envoy-max-retries must be strictly 1 and never amplified by remaining budget")
+		require.NotEqual(t, "29", headers["x-envoy-max-retries"],
+			"x-envoy-max-retries must NOT be amplified to budget - 1")
+	})
+
+	t.Run("ample budget (remaining 30) with unconfigured retries defaults to 0", func(t *testing.T) {
+		server := newServer()
+		defer server.Close()
+
+		router, reqCtx, protoReq := quorumFallbackRouter(server.URL)
+		router.Config.ClearRouteCache = true
+		reqCtx.ExpectStreamingResponse = true
+		protoReq.Stream = true
+
+		decision := &config.Decision{
+			Name: "fusion-stream-ample-budget-unconfigured-retry",
+			Algorithm: &config.AlgorithmConfig{
+				Type: config.DecisionAlgorithmFusion,
+				Fusion: &config.FusionAlgorithmConfig{
+					Model:          "judge",
+					AnalysisModels: []string{"panel-a"},
+					AnalysisMode:   config.FusionAnalysisModeOneCall,
+				},
+			},
+		}
+		reqCtx.VSRSelectedDecision = decision
+
+		looperReq, errResp := router.buildLooperRequest(protoReq, decision, reqCtx)
+		require.Nil(t, errResp)
+		require.NotNil(t, looperReq)
+
+		// Parent ledger with limit 31: 1 call used by panel-a, 30 remaining
+		execCtx, _ := budget.WithLimit(context.Background(), 31)
+		streamResp, err := router.handleLooperStreamingDispatch(execCtx, looperReq, decision, protoReq.Model, reqCtx)
+		require.NoError(t, err)
+		require.NotNil(t, streamResp)
+		require.Nil(t, streamResp.GetImmediateResponse())
+		require.True(t, reqCtx.LooperStreamingActive)
+		require.Equal(t, 30, reqCtx.LooperRemainingBudget, "remaining budget must be recorded as 30")
+
+		router.addEnvoyReliabilityHeaders(streamResp, reqCtx)
+
+		headers := headerValuesByName(streamResp.GetRequestBody().GetResponse().GetHeaderMutation().GetSetHeaders())
+		require.Equal(t, "0", headers["x-envoy-max-retries"],
+			"x-envoy-max-retries must be strictly 0 when no retries configured, never amplified to budget - 1")
+		require.NotEqual(t, "29", headers["x-envoy-max-retries"])
+	})
+
+	t.Run("LooperRemainingBudget == 3 with 5 retries clamps retries to 2", func(t *testing.T) {
+		five := 5
+		cases := []struct {
+			name          string
+			modelRetries  int
+			decisionRetry *int
+		}{
+			{
+				name:          "decision_configured_5_retries",
+				modelRetries:  0,
+				decisionRetry: &five,
+			},
+			{
+				name:          "model_configured_5_retries",
+				modelRetries:  5,
+				decisionRetry: nil,
+			},
+			{
+				name:          "both_configured_5_retries",
+				modelRetries:  5,
+				decisionRetry: &five,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				server := newServer()
+				defer server.Close()
+
+				router, reqCtx, protoReq := quorumFallbackRouter(server.URL)
+				router.Config.ClearRouteCache = true
+				reqCtx.ExpectStreamingResponse = true
+				protoReq.Stream = true
+
+				if tc.modelRetries > 0 {
+					modelCfg := router.Config.BackendModels.ModelConfig["judge"]
+					modelCfg.Reliability = config.ProviderReliability{RetryCount: tc.modelRetries}
+					router.Config.BackendModels.ModelConfig["judge"] = modelCfg
+				}
+
+				decision := &config.Decision{
+					Name: "fusion-stream-budget-3",
+					Algorithm: &config.AlgorithmConfig{
+						Type: config.DecisionAlgorithmFusion,
+						Fusion: &config.FusionAlgorithmConfig{
+							Model:          "judge",
+							AnalysisModels: []string{"panel-a"},
+							AnalysisMode:   config.FusionAnalysisModeOneCall,
+						},
+					},
+				}
+				if tc.decisionRetry != nil {
+					decision.Reliability = &config.DecisionReliability{
+						RetryCount: tc.decisionRetry,
+					}
+				}
+				reqCtx.VSRSelectedDecision = decision
+
+				looperReq, errResp := router.buildLooperRequest(protoReq, decision, reqCtx)
+				require.Nil(t, errResp)
+				require.NotNil(t, looperReq)
+
+				// Parent ledger with limit 4: 1 used by panel-a, 3 remaining
+				execCtx, _ := budget.WithLimit(context.Background(), 4)
+				streamResp, err := router.handleLooperStreamingDispatch(execCtx, looperReq, decision, protoReq.Model, reqCtx)
+				require.NoError(t, err)
+				require.NotNil(t, streamResp)
+				require.Nil(t, streamResp.GetImmediateResponse())
+				require.True(t, reqCtx.LooperStreamingActive)
+				require.Equal(t, 3, reqCtx.LooperRemainingBudget, "remaining budget must be recorded as 3")
+
+				router.addEnvoyReliabilityHeaders(streamResp, reqCtx)
+
+				headers := headerValuesByName(streamResp.GetRequestBody().GetResponse().GetHeaderMutation().GetSetHeaders())
+				require.Equal(t, "2", headers["x-envoy-max-retries"],
+					"x-envoy-max-retries must be clamped to 2 when LooperRemainingBudget == 3 and 5 retries configured")
+			})
+		}
+	})
+
+	t.Run("LooperRemainingBudget == 1 clamps retries to 0 regardless of model or decision retry config", func(t *testing.T) {
+		five := 5
+		cases := []struct {
+			name          string
+			modelRetries  int
+			decisionRetry *int
+		}{
+			{
+				name:          "target_model_retries_only",
+				modelRetries:  3,
+				decisionRetry: nil,
+			},
+			{
+				name:          "decision_retries_only",
+				modelRetries:  0,
+				decisionRetry: &five,
+			},
+			{
+				name:          "both_model_and_decision_retries",
+				modelRetries:  3,
+				decisionRetry: &five,
+			},
+			{
+				name:          "neither_configured",
+				modelRetries:  0,
+				decisionRetry: nil,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				server := newServer()
+				defer server.Close()
+
+				router, reqCtx, protoReq := quorumFallbackRouter(server.URL)
+				router.Config.ClearRouteCache = true
+				reqCtx.ExpectStreamingResponse = true
+				protoReq.Stream = true
+
+				if tc.modelRetries > 0 {
+					modelCfg := router.Config.BackendModels.ModelConfig["judge"]
+					modelCfg.Reliability = config.ProviderReliability{RetryCount: tc.modelRetries}
+					router.Config.BackendModels.ModelConfig["judge"] = modelCfg
+				}
+
+				decision := &config.Decision{
+					Name: "fusion-stream-budget-1",
+					Algorithm: &config.AlgorithmConfig{
+						Type: config.DecisionAlgorithmFusion,
+						Fusion: &config.FusionAlgorithmConfig{
+							Model:          "judge",
+							AnalysisModels: []string{"panel-a"},
+							AnalysisMode:   config.FusionAnalysisModeOneCall,
+						},
+					},
+				}
+				if tc.decisionRetry != nil {
+					decision.Reliability = &config.DecisionReliability{
+						RetryCount: tc.decisionRetry,
+					}
+				}
+				reqCtx.VSRSelectedDecision = decision
+
+				looperReq, errResp := router.buildLooperRequest(protoReq, decision, reqCtx)
+				require.Nil(t, errResp)
+				require.NotNil(t, looperReq)
+
+				// Parent ledger with limit 2: 1 used by panel-a, 1 remaining
+				execCtx, _ := budget.WithLimit(context.Background(), 2)
+				streamResp, err := router.handleLooperStreamingDispatch(execCtx, looperReq, decision, protoReq.Model, reqCtx)
+				require.NoError(t, err)
+				require.NotNil(t, streamResp)
+				require.Nil(t, streamResp.GetImmediateResponse())
+				require.True(t, reqCtx.LooperStreamingActive)
+				require.Equal(t, 1, reqCtx.LooperRemainingBudget, "remaining budget must be recorded as 1")
+
+				router.addEnvoyReliabilityHeaders(streamResp, reqCtx)
+
+				headers := headerValuesByName(streamResp.GetRequestBody().GetResponse().GetHeaderMutation().GetSetHeaders())
+				require.Equal(t, "0", headers["x-envoy-max-retries"],
+					"x-envoy-max-retries must be clamped to 0 when LooperRemainingBudget == 1")
+			})
+		}
+	})
+}
+
+type looperRealPipelineMockStream struct {
+	MockStream
+	cancelAfter int
+	cancelFn    context.CancelFunc
+}
+
+func (s *looperRealPipelineMockStream) Recv() (*ext_proc.ProcessingRequest, error) {
+	if s.cancelAfter > 0 && s.RecvIndex >= s.cancelAfter {
+		if s.cancelFn != nil {
+			s.cancelFn()
+		}
+		return nil, context.Canceled
+	}
+	return s.MockStream.Recv()
+}
+
+func TestLooperStreaming_ProcessRealPipeline(t *testing.T) {
+	newPipelineFixture := func(t *testing.T) (*httptest.Server, *OpenAIRouter, *store.MemoryStore) {
+		panelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				Model string `json:"model"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+			switch req.Model {
+			case "panel-a":
+				writeFusionReplayCompletion(w, req.Model, []map[string]interface{}{{
+					"index":         0,
+					"message":       map[string]interface{}{"role": "assistant", "content": "panel-a answer"},
+					"finish_reason": "stop",
+				}}, map[string]int64{"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12})
+			case "panel-b":
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte("panel-b simulated failure"))
+			default:
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		}))
+
+		memStore := store.NewMemoryStore(10, 0)
+		recorder := routerreplay.NewRecorder(memStore)
+
+		decision := &config.Decision{
+			Name: "fusion-quorum-real-pipeline",
+			Algorithm: &config.AlgorithmConfig{
+				Type: config.DecisionAlgorithmFusion,
+				Fusion: &config.FusionAlgorithmConfig{
+					Model:                  "judge",
+					AnalysisModels:         []string{"panel-a", "panel-b"},
+					MaxConcurrent:          2,
+					MinSuccessfulResponses: 2,
+					OnError:                config.FusionOnErrorSkip,
+					QuorumFailurePolicy:    config.FusionQuorumFailurePolicyFallback,
+					QuorumFallbackTarget:   "backup-model",
+				},
+			},
+		}
+
+		routerCfg := &config.RouterConfig{
+			RouterReplay: config.RouterReplayConfig{
+				Enabled: true,
+			},
+			Looper: config.LooperConfig{
+				Endpoint: panelServer.URL,
+			},
+			BackendModels: config.BackendModels{
+				ModelConfig: map[string]config.ModelParams{
+					"panel-a":      {Capabilities: []string{"chat"}},
+					"panel-b":      {Capabilities: []string{"chat"}},
+					"judge":        {Capabilities: []string{"chat"}},
+					"backup-model": {Capabilities: []string{"chat"}},
+				},
+			},
+			Recipes: []config.RoutingRecipe{
+				{
+					Name: config.DefaultRecipeName,
+					Profile: config.RoutingProfile{
+						Decisions: []config.Decision{*decision},
+					},
+				},
+			},
+		}
+
+		classifier, err := classification.BuildClassifier(routerCfg, nil, nil, nil)
+		require.NoError(t, err)
+
+		router := &OpenAIRouter{
+			Config:         routerCfg,
+			Classifier:     classifier,
+			ReplayRecorder: recorder,
+			ProtocolCodecs: protocolcodec.NewBuiltinRegistry(),
+		}
+
+		return panelServer, router, memStore
+	}
+
+	makeStandardRequests := func(requestID string) (*ext_proc.ProcessingRequest, *ext_proc.ProcessingRequest, *ext_proc.ProcessingRequest) {
+		headersReq := &ext_proc.ProcessingRequest{
+			Request: &ext_proc.ProcessingRequest_RequestHeaders{
+				RequestHeaders: &ext_proc.HttpHeaders{
+					Headers: &core.HeaderMap{
+						Headers: []*core.HeaderValue{
+							{Key: ":path", Value: "/v1/chat/completions"},
+							{Key: "content-type", Value: "application/json"},
+							{Key: "x-request-id", Value: requestID},
+						},
+					},
+				},
+			},
+		}
+		bodyReq := &ext_proc.ProcessingRequest{
+			Request: &ext_proc.ProcessingRequest_RequestBody{
+				RequestBody: &ext_proc.HttpBody{
+					Body:        []byte(`{"model":"vllm-sr/auto","messages":[{"role":"user","content":"hello"}],"stream":true}`),
+					EndOfStream: true,
+				},
+			},
+		}
+		respHeadersReq := &ext_proc.ProcessingRequest{
+			Request: &ext_proc.ProcessingRequest_ResponseHeaders{
+				ResponseHeaders: &ext_proc.HttpHeaders{
+					Headers: &core.HeaderMap{
+						Headers: []*core.HeaderValue{
+							{Key: ":status", Value: "200"},
+							{Key: "content-type", Value: "text/event-stream"},
+						},
+					},
+				},
+			},
+		}
+		return headersReq, bodyReq, respHeadersReq
+	}
+
+	t.Run("branch A: normal stream completion settles fallback_served and lifecycle completed", func(t *testing.T) {
+		server, router, memStore := newPipelineFixture(t)
+		defer server.Close()
+
+		var capturedCtx *RequestContext
+		router.OnRequestContext = func(ctx *RequestContext) {
+			capturedCtx = ctx
+		}
+
+		headersReq, bodyReq, respHeadersReq := makeStandardRequests("req-e2e-pipeline-branch-a")
+		chunk1Req := &ext_proc.ProcessingRequest{
+			Request: &ext_proc.ProcessingRequest_ResponseBody{
+				ResponseBody: &ext_proc.HttpBody{
+					Body:        []byte("data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"backup-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n"),
+					EndOfStream: false,
+				},
+			},
+		}
+		chunk2Req := &ext_proc.ProcessingRequest{
+			Request: &ext_proc.ProcessingRequest_ResponseBody{
+				ResponseBody: &ext_proc.HttpBody{
+					Body: []byte("data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"backup-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n" +
+						"data: [DONE]\n\n"),
+					EndOfStream: true,
+				},
+			},
+		}
+
+		mockStream := &looperRealPipelineMockStream{
+			MockStream: *NewMockStream([]*ext_proc.ProcessingRequest{
+				headersReq,
+				bodyReq,
+				respHeadersReq,
+				chunk1Req,
+				chunk2Req,
+			}),
+		}
+
+		err := router.Process(mockStream)
+		require.NoError(t, err)
+
+		require.NotNil(t, capturedCtx)
+		require.True(t, capturedCtx.LooperStreamingActive)
+		require.Equal(t, "backup-model", capturedCtx.VSRSelectedModel)
+		require.NotNil(t, capturedCtx.SemanticStreamState)
+		require.Nil(t, capturedCtx.SemanticStreamState.failed)
+		require.True(t, capturedCtx.SemanticStreamState.terminal)
+		require.False(t, capturedCtx.StreamingAborted)
+
+		// Quorum finalized to fallback_served
+		require.NotNil(t, capturedCtx.VSRFusionQuorum)
+		require.Equal(t, string(looper.FusionQuorumFallbackServed), capturedCtx.VSRFusionQuorum.Disposition)
+		require.Equal(t, "backup-model", capturedCtx.VSRFusionQuorum.FallbackTarget)
+
+		// Replay storage verification
+		records, err := memStore.List(context.Background())
+		require.NoError(t, err)
+		require.Len(t, records, 1)
+
+		record := records[0]
+		require.Equal(t, routerreplay.LifecycleCompleted, record.LifecycleState)
+		require.Equal(t, "response_complete", record.TerminalReason)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, "fallback_served", record.RouteDiagnostics.FusionQuorum.Disposition)
+		require.Equal(t, "backup-model", record.RouteDiagnostics.FusionQuorum.FallbackTarget)
+		require.Equal(t, 2, record.RouteDiagnostics.FusionQuorum.RequiredCount)
+		require.Equal(t, 1, record.RouteDiagnostics.FusionQuorum.UsableCount)
+
+		// Authoritative usage: panel-a (10 prompt, 2 completion) + synthesis (10 prompt, 5 completion) = 20, 7, 27
+		require.NotNil(t, record.PromptTokens)
+		require.NotNil(t, record.CompletionTokens)
+		require.NotNil(t, record.TotalTokens)
+		require.Equal(t, 20, *record.PromptTokens)
+		require.Equal(t, 7, *record.CompletionTokens)
+		require.Equal(t, 27, *record.TotalTokens)
+	})
+
+	t.Run("branch B: upstream stream incomplete settles response_encode_failed and lifecycle failed", func(t *testing.T) {
+		server, router, memStore := newPipelineFixture(t)
+		defer server.Close()
+
+		var capturedCtx *RequestContext
+		router.OnRequestContext = func(ctx *RequestContext) {
+			capturedCtx = ctx
+		}
+
+		headersReq, bodyReq, respHeadersReq := makeStandardRequests("req-e2e-pipeline-branch-b")
+		// Upstream disconnects after partial chunk without [DONE]
+		chunk1Req := &ext_proc.ProcessingRequest{
+			Request: &ext_proc.ProcessingRequest_ResponseBody{
+				ResponseBody: &ext_proc.HttpBody{
+					Body:        []byte("data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"backup-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n"),
+					EndOfStream: true,
+				},
+			},
+		}
+
+		mockStream := &looperRealPipelineMockStream{
+			MockStream: *NewMockStream([]*ext_proc.ProcessingRequest{
+				headersReq,
+				bodyReq,
+				respHeadersReq,
+				chunk1Req,
+			}),
+		}
+
+		err := router.Process(mockStream)
+		require.NoError(t, err)
+
+		require.NotNil(t, capturedCtx)
+		require.True(t, capturedCtx.LooperStreamingActive)
+		require.Equal(t, "backup-model", capturedCtx.VSRSelectedModel)
+		require.NotNil(t, capturedCtx.SemanticStreamState)
+		require.NotNil(t, capturedCtx.SemanticStreamState.failed, "real codec must register failure event in SemanticStreamState.failed")
+		require.Equal(t, "stream_incomplete", capturedCtx.SemanticStreamState.failed.Code)
+		require.Contains(t, capturedCtx.SemanticStreamState.failed.Error(), "stream_incomplete")
+		require.True(t, capturedCtx.StreamingAborted)
+
+		// Quorum must be response_encode_failed and strictly NOT cancelled
+		require.NotNil(t, capturedCtx.VSRFusionQuorum)
+		require.Equal(t, string(looper.FusionQuorumResponseEncodeFailed), capturedCtx.VSRFusionQuorum.Disposition)
+		require.NotEqual(t, string(looper.FusionQuorumCancelled), capturedCtx.VSRFusionQuorum.Disposition, "quorum must strictly NOT be cancelled on stream disconnect")
+		require.Equal(t, "backup-model", capturedCtx.VSRFusionQuorum.FallbackTarget)
+
+		// Replay storage verification: LifecycleFailed with upstream_stream_incomplete
+		records, err := memStore.List(context.Background())
+		require.NoError(t, err)
+		require.Len(t, records, 1)
+
+		record := records[0]
+		require.Equal(t, routerreplay.LifecycleFailed, record.LifecycleState)
+		require.Equal(t, "upstream_stream_incomplete", record.TerminalReason)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, "response_encode_failed", record.RouteDiagnostics.FusionQuorum.Disposition)
+		require.Equal(t, "backup-model", record.RouteDiagnostics.FusionQuorum.FallbackTarget)
+		require.Equal(t, 2, record.RouteDiagnostics.FusionQuorum.RequiredCount)
+		require.Equal(t, 1, record.RouteDiagnostics.FusionQuorum.UsableCount)
+
+		// Estimated usage: panel-a intermediate tokens (10 prompt, 2 completion) + estimated synthesis tokens
+		require.NotNil(t, record.PromptTokens)
+		require.NotNil(t, record.CompletionTokens)
+		require.NotNil(t, record.TotalTokens)
+		require.GreaterOrEqual(t, *record.PromptTokens, 10)
+		require.GreaterOrEqual(t, *record.CompletionTokens, 3)
+		require.Equal(t, *record.PromptTokens+*record.CompletionTokens, *record.TotalTokens)
+	})
+
+	t.Run("branch C: client cancellation settles quorum cancelled and lifecycle aborted", func(t *testing.T) {
+		server, router, memStore := newPipelineFixture(t)
+		defer server.Close()
+
+		var capturedCtx *RequestContext
+		router.OnRequestContext = func(ctx *RequestContext) {
+			capturedCtx = ctx
+		}
+
+		headersReq, bodyReq, respHeadersReq := makeStandardRequests("req-e2e-pipeline-branch-c")
+		chunk1Req := &ext_proc.ProcessingRequest{
+			Request: &ext_proc.ProcessingRequest_ResponseBody{
+				ResponseBody: &ext_proc.HttpBody{
+					Body:        []byte("data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"backup-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n"),
+					EndOfStream: false,
+				},
+			},
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		mockStream := &looperRealPipelineMockStream{
+			MockStream: *NewMockStream([]*ext_proc.ProcessingRequest{
+				headersReq,
+				bodyReq,
+				respHeadersReq,
+				chunk1Req,
+			}),
+			cancelAfter: 4,
+			cancelFn:    cancel,
+		}
+		mockStream.Ctx = ctx
+
+		err := router.Process(mockStream)
+		require.NoError(t, err)
+
+		require.NotNil(t, capturedCtx)
+		require.True(t, capturedCtx.LooperStreamingActive)
+		require.Equal(t, "backup-model", capturedCtx.VSRSelectedModel)
+		require.True(t, capturedCtx.StreamingAborted)
+
+		// Quorum must be cancelled
+		require.NotNil(t, capturedCtx.VSRFusionQuorum)
+		require.Equal(t, string(looper.FusionQuorumCancelled), capturedCtx.VSRFusionQuorum.Disposition)
+		require.Equal(t, "backup-model", capturedCtx.VSRFusionQuorum.FallbackTarget)
+
+		// Replay storage verification: LifecycleAborted with client_canceled
+		records, err := memStore.List(context.Background())
+		require.NoError(t, err)
+		require.Len(t, records, 1)
+
+		record := records[0]
+		require.Equal(t, routerreplay.LifecycleAborted, record.LifecycleState)
+		require.Equal(t, "client_canceled", record.TerminalReason)
+		require.NotNil(t, record.RouteDiagnostics)
+		require.NotNil(t, record.RouteDiagnostics.FusionQuorum)
+		require.Equal(t, "cancelled", record.RouteDiagnostics.FusionQuorum.Disposition)
+		require.Equal(t, "backup-model", record.RouteDiagnostics.FusionQuorum.FallbackTarget)
+		require.Equal(t, 2, record.RouteDiagnostics.FusionQuorum.RequiredCount)
+		require.Equal(t, 1, record.RouteDiagnostics.FusionQuorum.UsableCount)
+
+		// Estimated usage: panel-a intermediate tokens (10 prompt, 2 completion) + estimated synthesis tokens
+		require.NotNil(t, record.PromptTokens)
+		require.NotNil(t, record.CompletionTokens)
+		require.NotNil(t, record.TotalTokens)
+		require.GreaterOrEqual(t, *record.PromptTokens, 10)
+		require.GreaterOrEqual(t, *record.CompletionTokens, 3)
+		require.Equal(t, *record.PromptTokens+*record.CompletionTokens, *record.TotalTokens)
+	})
+}
+
+// TestEmbeddingContextPriorityContract verifies the precedence rules of embeddingContext():
+// 1. TraceContext takes highest priority when present (inheriting its deadline/cancellation).
+// 2. Context is used as fallback when TraceContext is nil.
+// 3. context.Background() is returned when both are nil or ctx itself is nil.
+func TestEmbeddingContextPriorityContract(t *testing.T) {
+	// Case 1: ctx == nil returns context.Background()
+	var nilCtx *RequestContext
+	require.Equal(t, context.Background(), nilCtx.embeddingContext())
+
+	// Case 2: ctx.Context is valid without deadline, but ctx.TraceContext has a timeout deadline.
+	// embeddingContext() must prioritize TraceContext, carrying its deadline and triggering <-done on expiration.
+	rawStreamCtx := context.Background()
+	timeoutDur := 50 * time.Millisecond
+	attemptCtx, cancelAttempt := context.WithTimeout(rawStreamCtx, timeoutDur)
+	defer cancelAttempt()
+
+	ctx := &RequestContext{
+		Context:      rawStreamCtx,
+		TraceContext: attemptCtx,
+	}
+
+	embCtx := ctx.embeddingContext()
+	deadline, hasDeadline := embCtx.Deadline()
+	require.True(t, hasDeadline, "returned context must have deadline")
+	expectedDeadline, _ := attemptCtx.Deadline()
+	require.Equal(t, expectedDeadline, deadline)
+
+	// Wait for the phase deadline to trigger
+	select {
+	case <-embCtx.Done():
+		require.ErrorIs(t, embCtx.Err(), context.DeadlineExceeded)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for embCtx.Done()")
+	}
+
+	// Verify the original stream context was NOT expired or canceled
+	require.NoError(t, rawStreamCtx.Err(), "raw stream context must remain active")
+
+	// Case 3: ctx.TraceContext == nil and ctx.Context != nil -> fallback to ctx.Context
+	fallbackCtx := &RequestContext{
+		Context:      rawStreamCtx,
+		TraceContext: nil,
+	}
+	require.Equal(t, rawStreamCtx, fallbackCtx.embeddingContext())
+
+	// Case 4: both ctx.TraceContext and ctx.Context are nil -> returns context.Background()
+	emptyCtx := &RequestContext{
+		Context:      nil,
+		TraceContext: nil,
+	}
+	require.Equal(t, context.Background(), emptyCtx.embeddingContext())
+}
+
+// TestEmbeddingContextFallbackPhaseRemoteDetectionDeadlineExceeded verifies that under a
+// fallback attempt context (where TraceContext has a short phase deadline while the original
+// gRPC Context is long-lived), remote detection relying on embeddingContext() accurately
+// cancels when the phase deadline expires and returns deadline exceeded, rather than hanging
+// on the unconstrained original stream context.
+func TestEmbeddingContextFallbackPhaseRemoteDetectionDeadlineExceeded(t *testing.T) {
+	// Mock remote hallucination detector that hangs longer than the attempt deadline
+	stop := make(chan struct{})
+	slowServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			// Client timed out / disconnected; abort promptly
+			return
+		case <-stop:
+			return
+		case <-time.After(5 * time.Second):
+			// If not canceled, return a valid detection response
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"choices": []map[string]interface{}{
+					{
+						"message": map[string]string{
+							"content": `{"hallucinated_spans":[]}`,
+						},
+					},
+				},
+			})
+		}
+	}))
+	t.Cleanup(func() {
+		close(stop)
+		slowServer.Close()
+	})
+
+	router, reqCtx := newHallucinationSignalRouter(t, slowServer, "header")
+
+	// Simulate gRPC stream initialization: long-lived Context
+	rawStreamCtx := context.Background()
+
+	// Simulate response fallback candidate attempt: short phase deadline mounted on TraceContext
+	phaseTimeout := 60 * time.Millisecond
+	attemptCtx, cancelAttempt := context.WithTimeout(rawStreamCtx, phaseTimeout)
+	defer cancelAttempt()
+
+	reqCtx.Context = rawStreamCtx
+	reqCtx.TraceContext = attemptCtx
+
+	// 1. Direct detection call via classifier using ctx.embeddingContext()
+	start := time.Now()
+	_, err := router.Classifier.DetectHallucination(
+		reqCtx.embeddingContext(),
+		reqCtx.ToolResultsContext,
+		reqCtx.UserContent,
+		hallucinationAnswer,
+	)
+	elapsed := time.Since(start)
+	t.Logf("DetectHallucination elapsed: %v", elapsed)
+
+	require.Error(t, err, "remote detection must fail when phase deadline expires")
+	isDeadlineExceeded := errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(err.Error(), "deadline exceeded") ||
+		strings.Contains(err.Error(), "context deadline exceeded")
+	require.Truef(t, isDeadlineExceeded, "expected deadline exceeded error, got: %v", err)
+	require.Less(t, elapsed, 1*time.Second, "remote detection must abort within attempt deadline, not hang on raw stream context")
+	require.NoError(t, rawStreamCtx.Err(), "raw stream context must remain valid and unexpired")
+
+	// 2. Direct detection with explanations via classifier using ctx.embeddingContext()
+	attemptCtx2, cancelAttempt2 := context.WithTimeout(rawStreamCtx, phaseTimeout)
+	defer cancelAttempt2()
+	reqCtx.TraceContext = attemptCtx2
+
+	start = time.Now()
+	_, err2 := router.Classifier.DetectHallucinationWithExplanations(
+		reqCtx.embeddingContext(),
+		reqCtx.ToolResultsContext,
+		reqCtx.UserContent,
+		hallucinationAnswer,
+	)
+	elapsed2 := time.Since(start)
+	t.Logf("DetectHallucinationWithExplanations elapsed: %v", elapsed2)
+
+	require.Error(t, err2, "remote detection with explanations must fail when phase deadline expires")
+	isDeadlineExceeded2 := errors.Is(err2, context.DeadlineExceeded) ||
+		strings.Contains(err2.Error(), "deadline exceeded") ||
+		strings.Contains(err2.Error(), "context deadline exceeded")
+	require.Truef(t, isDeadlineExceeded2, "expected deadline exceeded error, got: %v", err2)
+	require.Less(t, elapsed2, 1*time.Second, "remote detection must abort within attempt deadline")
+
+	// 3. Evidence detection helper via router using ctx.embeddingContext()
+	attemptCtx3, cancelAttempt3 := context.WithTimeout(rawStreamCtx, phaseTimeout)
+	defer cancelAttempt3()
+	reqCtx.TraceContext = attemptCtx3
+
+	start = time.Now()
+	evidence, err3 := router.detectHallucinationEvidence(
+		reqCtx.embeddingContext(),
+		router.Classifier,
+		reqCtx,
+		hallucinationAnswer,
+	)
+	elapsed3 := time.Since(start)
+	t.Logf("detectHallucinationEvidence elapsed: %v", elapsed3)
+
+	require.Error(t, err3, "evidence detection must fail when phase deadline expires")
+	require.Nil(t, evidence, "no evidence should be returned on deadline exceeded")
+	isDeadlineExceeded3 := errors.Is(err3, context.DeadlineExceeded) ||
+		strings.Contains(err3.Error(), "deadline exceeded") ||
+		strings.Contains(err3.Error(), "context deadline exceeded")
+	require.Truef(t, isDeadlineExceeded3, "expected deadline exceeded error, got: %v", err3)
+	require.Less(t, elapsed3, 1*time.Second, "evidence detection must abort within attempt deadline")
+}

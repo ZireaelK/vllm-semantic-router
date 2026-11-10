@@ -401,6 +401,12 @@ func (r *Recorder) UpdateToolTrace(id string, trace ToolTrace) error {
 	return r.storage.UpdateToolTrace(ctx, id, trace)
 }
 
+func (r *Recorder) UpdateFusionQuorum(id string, quorum store.FusionQuorumDiagnostics) error {
+	ctx, cancel := r.replayOperationContext()
+	defer cancel()
+	return r.storage.UpdateFusionQuorum(ctx, id, quorum)
+}
+
 // Reader returns the underlying store.Reader so that read-only consumers (e.g.
 // lookup table builders) can query historical records without needing write access.
 func (r *Recorder) Reader() store.Reader {

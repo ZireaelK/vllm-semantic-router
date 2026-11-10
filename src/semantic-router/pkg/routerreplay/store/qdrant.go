@@ -318,6 +318,16 @@ func (q *QdrantStore) UpdateToolTrace(ctx context.Context, id string, trace Tool
 	})
 }
 
+// UpdateFusionQuorum updates fusion quorum diagnostics for an existing record.
+func (q *QdrantStore) UpdateFusionQuorum(ctx context.Context, id string, quorum FusionQuorumDiagnostics) error {
+	return q.updateRecord(ctx, id, func(r *Record) {
+		if r.RouteDiagnostics == nil {
+			r.RouteDiagnostics = &RouteDiagnostics{}
+		}
+		r.RouteDiagnostics.FusionQuorum = cloneFusionQuorumDiagnostics(&quorum)
+	})
+}
+
 func (q *QdrantStore) Close() error {
 	return q.lifecycle.close(func() error {
 		if q.asyncWrites {

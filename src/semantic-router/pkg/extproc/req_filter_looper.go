@@ -33,6 +33,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/protocolcodec"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing/budget"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/selection"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/sessiontelemetry"
 )
@@ -150,7 +151,7 @@ func (r *OpenAIRouter) shouldStreamLooperFinalStage(
 	request *llmprotocol.Request,
 	decision *config.Decision,
 ) bool {
-	if r != nil && r.Config != nil && !r.Config.Looper.IsStreamingEnabled() {
+	if r == nil || r.Config == nil || !r.Config.Looper.IsStreamingEnabled() {
 		return false
 	}
 	if decision == nil || decision.Algorithm == nil || decision.Algorithm.Type != config.DecisionAlgorithmFusion {
@@ -168,6 +169,52 @@ func (r *OpenAIRouter) shouldStreamLooperFinalStage(
 	if isResponseAPIRequest(reqCtx) {
 		return false
 	}
+
+	targetModel := strings.TrimSpace(ownership.TargetModel)
+	if targetModel == "" && decision.Algorithm.Fusion != nil {
+		targetModel = strings.TrimSpace(decision.Algorithm.Fusion.Model)
+	}
+	if targetModel == "" && len(decision.ModelRefs) > 0 {
+		targetModel = strings.TrimSpace(decision.ModelRefs[0].Model)
+	}
+	if targetModel == "" {
+		return false
+	}
+
+	format, err := wireFormatForModel(r.Config.GetModelAPIFormat(targetModel))
+	if err != nil || format != llmprotocol.OpenAIChatV1 {
+		return false
+	}
+	if reqCtx != nil {
+		backendModel := reqCtx.backendModelForCandidate(targetModel)
+		if backendModel != "" && backendModel != targetModel {
+			format, err := wireFormatForModel(r.Config.GetModelAPIFormat(backendModel))
+			if err != nil || format != llmprotocol.OpenAIChatV1 {
+				return false
+			}
+		}
+	}
+
+	var fallbackTarget string
+	if decision.Algorithm.Fusion != nil {
+		fallbackTarget = strings.TrimSpace(decision.Algorithm.Fusion.QuorumFallbackTarget)
+	}
+	if fallbackTarget != "" {
+		format, err := wireFormatForModel(r.Config.GetModelAPIFormat(fallbackTarget))
+		if err != nil || format != llmprotocol.OpenAIChatV1 {
+			return false
+		}
+		if reqCtx != nil {
+			backendFallback := reqCtx.backendModelForCandidate(fallbackTarget)
+			if backendFallback != "" && backendFallback != fallbackTarget {
+				format, err := wireFormatForModel(r.Config.GetModelAPIFormat(backendFallback))
+				if err != nil || format != llmprotocol.OpenAIChatV1 {
+					return false
+				}
+			}
+		}
+	}
+
 	return ownership.Eligibility == looper.StreamingEligible
 }
 
@@ -178,6 +225,13 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 	originalModel string,
 	reqCtx *RequestContext,
 ) (*ext_proc.ProcessingResponse, error) {
+	limit := config.MaxUpstreamCallsPerRequest
+	if decision != nil && decision.Algorithm != nil && decision.Algorithm.Budget != nil && decision.Algorithm.Budget.MaxCalls > 0 {
+		limit = decision.Algorithm.Budget.MaxCalls
+	}
+	var ledger *budget.Ledger
+	ctx, ledger = budget.WithLimit(ctx, limit)
+
 	runtimeConfig := r.Config.Looper
 	for _, entrypoint := range r.Config.EffectiveEntrypoints(config.ChatAPI) {
 		runtimeConfig.EntrypointModels = append(runtimeConfig.EntrypointModels, entrypoint.ModelNames...)
@@ -201,7 +255,13 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 		return r.finalizeLooperBufferedResponse(resp, decision, originalModel, reqCtx)
 	}
 
+	ledger, _ = budget.Current(ctx)
 	plan, err := streamingLooper.PrepareStreamingSynthesis(ctx, looperReq)
+	if err == nil && ledger != nil && ledger.Remaining() < 1 {
+		err = budget.ErrExhausted
+	} else if err != nil && ledger != nil && ledger.Remaining() < 1 && !errors.Is(err, budget.ErrExhausted) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		err = errors.Join(budget.ErrExhausted, err)
+	}
 	if err != nil {
 		logging.ComponentErrorEvent("extproc", "looper_streaming_prepare_failed", map[string]interface{}{
 			"request_id": reqCtx.RequestID,
@@ -210,6 +270,23 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 			"error":      err.Error(),
 		})
 		evidence, _ := looperFailureEvidenceFromError(err)
+		if plan != nil {
+			if evidence.algorithm == "" && decision != nil && decision.Algorithm != nil {
+				evidence.algorithm = decision.Algorithm.Type
+			}
+			if len(evidence.modelsUsed) == 0 {
+				evidence.modelsUsed = plan.ModelsUsed
+			}
+			if evidence.iterations == 0 {
+				evidence.iterations = plan.Iterations
+			}
+			if evidence.usage.IsZero() {
+				evidence.usage = plan.IntermediateUsage
+			}
+			if evidence.fusionQuorum == nil {
+				evidence.fusionQuorum = plan.QuorumOutcome
+			}
+		}
 		if evidence.algorithm == "" && decision != nil && decision.Algorithm != nil {
 			evidence.algorithm = decision.Algorithm.Type
 		}
@@ -217,34 +294,105 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 		if outcome, ok := looper.FusionQuorumOutcomeFromError(err); ok {
 			quorumOutcome = outcome
 			evidence.fusionQuorum = quorumOutcome
+		} else if plan != nil && plan.QuorumOutcome != nil {
+			quorumOutcome = plan.QuorumOutcome
 		}
 		finalizeLooperQuorumOutcome(reqCtx, quorumOutcome, decision, false)
 
 		statusCode := 502
 		lifecycleState := routerreplay.LifecycleFailed
 		reason := "looper_streaming_prepare_failed"
+		msg := "Looper intermediate execution failed"
 
-		if errors.Is(err, context.Canceled) || (quorumOutcome != nil && quorumOutcome.Disposition == looper.FusionQuorumCancelled) {
-			statusCode = 500
-			lifecycleState = routerreplay.LifecycleAborted
-			reason = "client_cancelled_during_looper_prepare"
-			if reqCtx != nil {
-				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInternal, "request_canceled", "request canceled", err)
-			}
-		} else if errors.Is(err, context.DeadlineExceeded) {
+		var windowErr *looper.StageContextWindowError
+		if errors.Is(err, context.DeadlineExceeded) {
 			statusCode = 504
 			reason = "looper_streaming_deadline_exceeded"
+			msg = "Looper streaming deadline exceeded"
 			if reqCtx != nil {
 				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorUpstreamTimeout, "request_timeout", "request timed out", err)
 			}
+		} else if errors.Is(err, context.Canceled) || (quorumOutcome != nil && quorumOutcome.Disposition == looper.FusionQuorumCancelled) {
+			statusCode = 500
+			lifecycleState = routerreplay.LifecycleAborted
+			reason = "client_cancelled_during_looper_prepare"
+			msg = "Client cancelled during looper prepare"
+			if reqCtx != nil {
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInternal, "request_canceled", "request canceled", err)
+			}
+		} else if errors.As(err, &windowErr) || (quorumOutcome != nil && quorumOutcome.Disposition == looper.FusionQuorumBudgetExhausted) {
+			statusCode = 400
+			reason = "looper_stage_context_exceeded"
+			msg = "Looper stage context window exceeded"
+			if reqCtx != nil {
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInvalidRequest, "context_length_exceeded", "Looper stage context window exceeded", err)
+			}
+		} else if errors.Is(err, budget.ErrExhausted) {
+			statusCode = 400
+			reason = "looper_budget_exhausted"
+			msg = "Looper budget exhausted"
+			if reqCtx != nil {
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInvalidRequest, "budget_exhausted", "Looper budget exhausted", err)
+			}
+			observed := 0
+			if ledger != nil {
+				observed = ledger.Used()
+			}
+			algorithm := ""
+			if decision != nil && decision.Algorithm != nil {
+				algorithm = decision.Algorithm.Type
+			}
+			logging.ComponentErrorEvent("extproc", "looper_call_budget_exhausted", map[string]interface{}{
+				"request_id": reqCtx.RequestID,
+				"decision":   decision.Name,
+				"algorithm":  algorithm,
+				"limit":      limit,
+				"hops":       observed,
+				"calls":      observed,
+			})
 		}
 
 		return r.recordLooperFailureWithLifecycle(
 			reqCtx, originalModel, decision, statusCode,
-			"Looper intermediate execution failed", lifecycleState, reason,
+			msg, lifecycleState, reason,
 			evidence,
 		), nil
 	}
+
+	targetModel := strings.TrimSpace(plan.TargetModel)
+	if targetModel == "" && plan.SynthesisParams != nil {
+		targetModel = strings.TrimSpace(plan.SynthesisParams.Model)
+	}
+
+	if reqCtx != nil {
+		if ledger != nil {
+			reqCtx.LooperRemainingBudget = ledger.Remaining()
+		}
+		reqCtx.LooperIntermediateUsage = plan.IntermediateUsage
+		reqCtx.LooperModelsUsed = plan.ModelsUsed
+		reqCtx.LooperIterations = plan.Iterations
+		reqCtx.LooperTrace = plan.Trace
+		reqCtx.LooperTargetModel = targetModel
+		reqCtx.RequestModel = originalModel
+		reqCtx.VSRSelectedModel = targetModel
+		if decision != nil && decision.Algorithm != nil {
+			reqCtx.VSRSelectionMethod = decision.Algorithm.Type
+		}
+		if decision != nil {
+			reqCtx.VSRSelectedDecisionName = decision.Name
+		}
+		reqCtx.LooperStreamingActive = true
+	}
+
+	success := false
+	defer func() {
+		if !success {
+			if rec := recover(); rec != nil {
+				panic(rec)
+			}
+			reqCtx.LooperStreamingActive = false
+		}
+	}()
 
 	rawSynthesisBody, err := json.Marshal(plan.SynthesisParams)
 	if err != nil {
@@ -262,19 +410,6 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 		), nil
 	}
 
-	targetModel := strings.TrimSpace(plan.TargetModel)
-	if targetModel == "" && plan.SynthesisParams != nil {
-		targetModel = strings.TrimSpace(plan.SynthesisParams.Model)
-	}
-
-	reqCtx.LooperStreamingActive = true
-	success := false
-	defer func() {
-		if !success {
-			reqCtx.LooperStreamingActive = false
-		}
-	}()
-
 	dispatchResponse, synthesisTextBytes, err := r.buildLooperStreamingDispatchResponse(
 		rawSynthesisBody, targetModel, decision, reqCtx,
 	)
@@ -287,10 +422,18 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 
 		var maskingErr *maskingDispatchError
 		var budgetErr *selection.RequestBudgetError
+		var windowErr *looper.StageContextWindowError
 		if errors.As(err, &maskingErr) {
 			statusCode = http.StatusServiceUnavailable // 503
 			reason = "looper_stream_dispatch_masking_unavailable"
 			msg = maskingUnavailableMessage
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			statusCode = 504
+			reason = "looper_stream_dispatch_deadline_exceeded"
+			msg = "Looper streaming dispatch deadline exceeded"
+			if reqCtx != nil {
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorUpstreamTimeout, "request_timeout", "request timed out", err)
+			}
 		} else if errors.Is(err, context.Canceled) {
 			statusCode = 500
 			lifecycleState = routerreplay.LifecycleAborted
@@ -298,6 +441,20 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 			msg = "Client cancelled during looper dispatch"
 			if reqCtx != nil {
 				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInternal, "request_canceled", "request canceled", err)
+			}
+		} else if errors.As(err, &windowErr) {
+			statusCode = 400
+			reason = "looper_stage_context_exceeded"
+			msg = "Looper stage context window exceeded"
+			if reqCtx != nil {
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInvalidRequest, "context_length_exceeded", "Looper stage context window exceeded", err)
+			}
+		} else if errors.Is(err, budget.ErrExhausted) {
+			statusCode = 400
+			reason = "looper_budget_exhausted"
+			msg = "Looper budget exhausted"
+			if reqCtx != nil {
+				reqCtx.ImmediateProtocolError = llmprotocol.NewError(llmprotocol.ErrorInvalidRequest, "budget_exhausted", "Looper budget exhausted", err)
 			}
 		} else if errors.As(err, &budgetErr) {
 			statusCode = 400
@@ -343,7 +500,13 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 	// Update RequestContext state for subsequent response stream handling and audit
 	reqCtx.LooperTargetModel = targetModel
 	reqCtx.LooperSynthesisTextBytes = synthesisTextBytes
+	if reqCtx.LooperSynthesisPromptTokens <= 0 && synthesisTextBytes > 0 {
+		reqCtx.LooperSynthesisPromptTokens = max(1, (synthesisTextBytes+3)/4)
+	}
 	reqCtx.LooperIntermediateUsage = plan.IntermediateUsage
+	if ledger != nil {
+		reqCtx.LooperRemainingBudget = ledger.Remaining()
+	}
 	reqCtx.LooperTrace = plan.Trace
 	reqCtx.LooperModelsUsed = plan.ModelsUsed
 	reqCtx.LooperIterations = plan.Iterations
@@ -351,8 +514,16 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 	reqCtx.VSRSelectedModel = targetModel
 	reqCtx.RequestModel = originalModel // Preserve client's original requested model for rewrite & accounting
 	reqCtx.VSRSelectionMethod = decision.Algorithm.Type
+	if reqCtx.VSRSelectedDecision == nil && decision != nil {
+		reqCtx.VSRSelectedDecision = decision
+	}
+	if reqCtx.VSRSelectedDecisionName == "" && decision != nil {
+		reqCtx.VSRSelectedDecisionName = decision.Name
+	}
 
-	finalizeLooperQuorumOutcome(reqCtx, plan.QuorumOutcome, decision, true)
+	if plan.QuorumOutcome != nil {
+		reqCtx.PendingLooperQuorumOutcome = plan.QuorumOutcome
+	}
 
 	// Start replay so downstream stream completion or cancellation can record usage and lifecycle
 	r.startRouterReplay(reqCtx, originalModel, targetModel, decision.Name)
@@ -367,6 +538,28 @@ func (r *OpenAIRouter) handleLooperStreamingDispatch(
 	})
 
 	return dispatchResponse, nil
+}
+
+func updateLooperSynthesisPromptMetrics(reqCtx *RequestContext, fallback *llmprotocol.Request) int {
+	target := fallback
+	if reqCtx != nil && reqCtx.SemanticRequest != nil {
+		target = reqCtx.SemanticRequest
+	}
+	if target == nil {
+		return 0
+	}
+	signals := extractSemanticRequestSignals(target)
+	if reqCtx != nil {
+		reqCtx.LooperSynthesisPromptTokens = signals.ContextTokenFloor
+		if reqCtx.LooperSynthesisPromptTokens <= 0 && signals.ContextTextBytes > 0 {
+			reqCtx.LooperSynthesisPromptTokens = max(1, (signals.ContextTextBytes+3)/4)
+		}
+	}
+	return signals.ContextTextBytes
+}
+
+func looperSynthesisSamplingTextBytes(reqCtx *RequestContext, fallback *llmprotocol.Request) int {
+	return updateLooperSynthesisPromptMetrics(reqCtx, fallback)
 }
 
 func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
@@ -400,7 +593,6 @@ func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
 	synthesisReq.Stream = true
 	synthesisReq.StreamOptions = clientOptions
 	synthesisReq.Generation++
-	synthesisTextBytes := extractSemanticRequestSignals(&synthesisReq).ContextTextBytes
 
 	// Retire the client's raw byte-replay envelope because the outgoing payload
 	// is now the synthesized/fallback stage request.
@@ -422,10 +614,13 @@ func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
 		reqCtx.SemanticRequest.Stream = true
 		response := r.buildProviderDispatchResponse(dispatch, reqCtx)
 		if response.GetImmediateResponse() != nil {
-			return response, synthesisTextBytes, nil
+			return response, updateLooperSynthesisPromptMetrics(reqCtx, &synthesisReq), nil
 		}
 		finalized, finErr := r.finalizeProviderDispatchResponse(dispatch, response, reqCtx)
-		return finalized, synthesisTextBytes, finErr
+		if finErr != nil {
+			return nil, 0, finErr
+		}
+		return finalized, updateLooperSynthesisPromptMetrics(reqCtx, &synthesisReq), nil
 	}
 
 	// Legacy Looper.Endpoint-only test fixtures have no VLLMEndpoints; still
@@ -464,7 +659,7 @@ func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
 	}
 	if r.CredentialResolver != nil {
 		if credErr := r.appendProviderCredential(state, dispatch.effectiveBackendModel(), "", reqCtx); credErr != nil {
-			return credErr, synthesisTextBytes, nil
+			return credErr, updateLooperSynthesisPromptMetrics(reqCtx, &synthesisReq), nil
 		}
 	}
 	appendRoutingHeaders(&state.setHeaders, dispatch.effectiveBackendModel())
@@ -485,7 +680,7 @@ func (r *OpenAIRouter) buildLooperStreamingDispatchResponse(
 	appendContentLengthHeader(&state.setHeaders, len(mutatedBody))
 	response := buildRequestBodyContinueResponse(state, nil, r.shouldClearRouteCache())
 	bindPreparedDispatchArtifact(response.GetRequestBody().GetResponse(), reqCtx, mutatedBody, dispatch.targetFormat)
-	return response, synthesisTextBytes, nil
+	return response, updateLooperSynthesisPromptMetrics(reqCtx, &synthesisReq), nil
 }
 
 func (r *OpenAIRouter) finalizeLooperBufferedResponse(

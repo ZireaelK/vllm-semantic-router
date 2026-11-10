@@ -464,6 +464,9 @@ type Enricher interface {
 
 	// UpdateToolTrace updates the request-local tool-calling timeline for an existing record.
 	UpdateToolTrace(ctx context.Context, id string, trace ToolTrace) error
+
+	// UpdateFusionQuorum updates fusion quorum diagnostics for an existing record.
+	UpdateFusionQuorum(ctx context.Context, id string, quorum FusionQuorumDiagnostics) error
 }
 
 // Storage is the interface that all storage backends must implement.

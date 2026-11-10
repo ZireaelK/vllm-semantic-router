@@ -118,6 +118,9 @@ type OpenAIRouter struct {
 	// paths back through package-global API-server state.
 	RuntimeRegistry *routerruntime.Registry
 
+	// OnRequestContext is an optional hook called when a new RequestContext is initialized.
+	OnRequestContext func(ctx *RequestContext)
+
 	// FallbackOrchestrator manages bounded execution and fallback across model candidates.
 	FallbackOrchestrator        *fallback.Orchestrator
 	RecipeFallbackOrchestrators map[config.RecipeName]*fallback.Orchestrator

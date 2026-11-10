@@ -71,6 +71,15 @@ func finalizeLooperQuorumOutcome(
 		"disposition":     string(outcome.Disposition),
 	})
 	reqCtx.VSRFusionQuorum = looperQuorumOutcomeDiagnostics(outcome)
+	if reqCtx.RouterReplayRecorder != nil && reqCtx.RouterReplayID != "" && reqCtx.VSRFusionQuorum != nil {
+		if err := reqCtx.RouterReplayRecorder.UpdateFusionQuorum(reqCtx.RouterReplayID, *reqCtx.VSRFusionQuorum); err != nil {
+			logging.ComponentErrorEvent("extproc", "router_replay_fusion_quorum_update_failed", map[string]interface{}{
+				"request_id": reqCtx.RequestID,
+				"replay_id":  reqCtx.RouterReplayID,
+				"error":      err.Error(),
+			})
+		}
+	}
 }
 
 func decisionName(decision *config.Decision) string {

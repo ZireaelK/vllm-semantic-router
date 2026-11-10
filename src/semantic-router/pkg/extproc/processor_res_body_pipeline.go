@@ -13,6 +13,7 @@ import (
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/headers"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/looper"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 )
@@ -37,6 +38,11 @@ func (r *OpenAIRouter) handleNonStreamingResponseBody(
 			decodeEvent["cause"] = cause.Error()
 		}
 		logging.ComponentErrorEvent("extproc", "neutral_response_decode_failed", decodeEvent)
+		if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
+			ctx.PendingLooperQuorumOutcome.Disposition = looper.FusionQuorumResponseEncodeFailed
+			finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
+			ctx.PendingLooperQuorumOutcome = nil
+		}
 		return r.createErrorResponse(502, "The selected model returned an invalid response")
 	}
 	decodedDiagnosticsEnd := len(ctx.ProtocolDiagnostics)
@@ -55,6 +61,10 @@ func (r *OpenAIRouter) handleNonStreamingResponseBody(
 	if rewriteClientBody {
 		clientBody, err = r.encodeClientResponse(*semanticResponse, ctx)
 		if err != nil {
+			if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
+				finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
+				ctx.PendingLooperQuorumOutcome = nil
+			}
 			return r.createErrorResponse(502, "The selected model returned an incompatible response")
 		}
 		ctx.ProtocolDiagnostics = deduplicateReencodedResponseDiagnostics(
@@ -103,7 +113,17 @@ func (r *OpenAIRouter) handleNonStreamingResponseBody(
 	blocked, finalBody, headerOptions := r.finalizeResponsePolicy(ctx, semanticResponse, clientBody)
 	lateWarning, hasLateDiagnostics := recordBufferedProtocolDiagnostics(ctx, diagnosticsBeforeBody)
 	if blocked != nil {
+		if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
+			ctx.PendingLooperQuorumOutcome.Disposition = looper.FusionQuorumResponseEncodeFailed
+			finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
+			ctx.PendingLooperQuorumOutcome = nil
+		}
 		return blocked
+	}
+
+	if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
+		finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, true)
+		ctx.PendingLooperQuorumOutcome = nil
 	}
 
 	response := buildResponseBodyContinueResponse(nil, nil)

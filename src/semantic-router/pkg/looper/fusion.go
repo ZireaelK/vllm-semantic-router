@@ -216,10 +216,7 @@ func (l *FusionLooper) Execute(ctx context.Context, req *Request) (*Response, er
 	// model calls, so usage is summed from the full panel (the real cost paid).
 	groundedPanel, groundingScores, groundingMode, err := l.applyGrounding(ctx, req, cfg, panel.responses)
 	if err != nil {
-		if !panel.usage.IsZero() {
-			return nil, newFusionPanelStageError(err, panel, panel.usage, len(panel.dispatchedModels))
-		}
-		return nil, err
+		return nil, newFusionPanelStageError(err, panel, panel.usage, len(panel.dispatchedModels))
 	}
 
 	panelAttempts := len(panel.dispatchedModels)
@@ -227,18 +224,15 @@ func (l *FusionLooper) Execute(ctx context.Context, req *Request) (*Response, er
 		ctx, req, cfg, groundedPanel, groundingScores, panelAttempts+1)
 	if err != nil {
 		usage := panel.usage.Add(judge.analysisResponse, judge.finalResponse)
-		if !usage.IsZero() {
-			judgeAttempts := judge.iterations
-			var additionalModels []string
-			if judgeAttempts > 0 || cfg.AnalysisMode == config.FusionAnalysisModeSeparate {
-				if judgeAttempts == 0 {
-					judgeAttempts = 1
-				}
-				additionalModels = []string{cfg.Model}
+		judgeAttempts := judge.iterations
+		var additionalModels []string
+		if judgeAttempts > 0 || cfg.AnalysisMode == config.FusionAnalysisModeSeparate {
+			if judgeAttempts == 0 {
+				judgeAttempts = 1
 			}
-			return nil, newFusionPanelStageError(err, panel, usage, panelAttempts+judgeAttempts, additionalModels...)
+			additionalModels = []string{cfg.Model}
 		}
-		return nil, err
+		return nil, newFusionPanelStageError(err, panel, usage, panelAttempts+judgeAttempts, additionalModels...)
 	}
 	usage := panel.usage.Add(judge.analysisResponse, judge.finalResponse)
 

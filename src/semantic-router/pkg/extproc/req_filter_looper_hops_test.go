@@ -10,6 +10,7 @@ import (
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/headers"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing/budget"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing/graph"
 )
 
@@ -34,6 +35,9 @@ func directLooperHops(endpoint string) graph.Caller {
 type directHopCaller struct{ endpoint string }
 
 func (c directHopCaller) Call(ctx context.Context, req *graph.HopRequest) (*graph.HopResponse, error) {
+	if err := budget.Consume(ctx); err != nil {
+		return nil, err
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(req.Request.Body))
 	if err != nil {
 		return nil, err

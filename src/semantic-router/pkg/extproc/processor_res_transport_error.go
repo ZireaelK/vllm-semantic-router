@@ -7,6 +7,7 @@ import (
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/headers"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/looper"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 )
@@ -60,6 +61,11 @@ func (r *OpenAIRouter) handleUpstreamTransportError(
 	setResponseContentType(response, "application/json")
 	if warning, ok := recordBufferedProtocolDiagnostics(ctx, diagnosticsBeforeBody); ok {
 		setResponseBodyHeaderOverwrite(response, headers.VSRProtocolWarnings, warning)
+	}
+	if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
+		ctx.PendingLooperQuorumOutcome.Disposition = looper.FusionQuorumResponseEncodeFailed
+		finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
+		ctx.PendingLooperQuorumOutcome = nil
 	}
 	if ctx != nil && ctx.LooperStreamingActive && !ctx.LooperUsageSettled {
 		settleErr := err

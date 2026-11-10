@@ -87,7 +87,8 @@ func maybeRecordResponseHeaderTTFT(ctx *RequestContext) {
 		ctx.IsStreamingResponse ||
 		ctx.TTFTRecorded ||
 		ctx.ProcessingStartTime.IsZero() ||
-		ctx.RequestModel == "" {
+		ctx.RequestModel == "" ||
+		ctx.LooperStreamingActive {
 		return
 	}
 

@@ -2,8 +2,10 @@ package looper
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -610,4 +612,133 @@ func TestPrepareStreamingSynthesis_AnalysisErrorReturnsFusionStageFailureError(t
 	assert.Equal(t, 3, stageErr.Iterations)
 }
 
+func TestNewFusionPanelStageError_ZeroUsagePreservesEvidence(t *testing.T) {
+	panel := fusionPanelOutcome{
+		dispatchedModels: []string{"m1", "m2"},
+	}
+	cause := assert.AnError
 
+	err := newFusionPanelStageError(cause, panel, TokenUsage{}, 2)
+	require.Error(t, err)
+
+	var stageErr *FusionStageFailureError
+	require.ErrorAs(t, err, &stageErr)
+	assert.Equal(t, cause, stageErr.Cause)
+	assert.Equal(t, []string{"m1", "m2"}, stageErr.ModelsUsed)
+	assert.Equal(t, 2, stageErr.Iterations)
+	assert.True(t, stageErr.Usage.IsZero())
+}
+
+func TestPrepareStreamingSynthesis_AnalysisErrorZeroUsagePreservesEvidence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		w.Header().Set("Content-Type", "application/json")
+		if payload.Model == "judge" {
+			cancel()
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "judge fail"})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":      "chatcmpl-test",
+			"object":  "chat.completion",
+			"created": 1,
+			"model":   payload.Model,
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"message": map[string]interface{}{
+						"role":    "assistant",
+						"content": "panel answer",
+					},
+					"finish_reason": "stop",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	req := newFusionTestRequest()
+	req.IsStreaming = true
+	req.Algorithm = &config.AlgorithmConfig{
+		Type: "fusion",
+		Fusion: &config.FusionAlgorithmConfig{
+			Model:          "judge",
+			AnalysisModels: []string{"panel-a", "panel-b"},
+			AnalysisMode:   config.FusionAnalysisModeSeparate,
+		},
+	}
+
+	looper := NewFusionLooper(&config.LooperConfig{Endpoint: server.URL})
+	plan, err := looper.PrepareStreamingSynthesis(ctx, req)
+	require.Error(t, err)
+	assert.Nil(t, plan)
+
+	var qErr *FusionQuorumError
+	assert.False(t, errors.As(err, &qErr), "analysis error must not be classified as FusionQuorumError")
+
+	var stageErr *FusionStageFailureError
+	require.ErrorAs(t, err, &stageErr)
+	assert.True(t, stageErr.Usage.IsZero(), "usage should be zero when upstream returned none")
+	assert.Equal(t, []string{"panel-a", "panel-b", "judge"}, stageErr.ModelsUsed)
+	assert.Equal(t, 3, stageErr.Iterations)
+}
+
+func TestFusionExecute_IntermediateStageFailureZeroUsagePreservesEvidence(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		w.Header().Set("Content-Type", "application/json")
+		if payload.Model == "judge" {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "bad gateway"})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":      "chatcmpl-test",
+			"object":  "chat.completion",
+			"created": 1,
+			"model":   payload.Model,
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"message": map[string]interface{}{
+						"role":    "assistant",
+						"content": "panel answer",
+					},
+					"finish_reason": "stop",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	req := newFusionTestRequest()
+	req.Algorithm = &config.AlgorithmConfig{
+		Type: "fusion",
+		Fusion: &config.FusionAlgorithmConfig{
+			Model:          "judge",
+			AnalysisModels: []string{"panel-a", "panel-b"},
+			AnalysisMode:   config.FusionAnalysisModeOneCall,
+		},
+	}
+
+	looper := NewFusionLooper(&config.LooperConfig{Endpoint: server.URL})
+	resp, err := looper.Execute(context.Background(), req)
+	require.Error(t, err)
+	assert.Nil(t, resp)
+
+	var stageErr *FusionStageFailureError
+	require.ErrorAs(t, err, &stageErr)
+	assert.True(t, stageErr.Usage.IsZero(), "usage should be zero when upstream returned none")
+	assert.Equal(t, []string{"panel-a", "panel-b", "judge"}, stageErr.ModelsUsed)
+	assert.Equal(t, 3, stageErr.Iterations)
+}

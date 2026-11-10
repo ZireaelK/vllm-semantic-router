@@ -496,6 +496,16 @@ func (m *MilvusStore) UpdateToolTrace(ctx context.Context, id string, trace Tool
 	})
 }
 
+// UpdateFusionQuorum updates fusion quorum diagnostics for an existing record.
+func (m *MilvusStore) UpdateFusionQuorum(ctx context.Context, id string, quorum FusionQuorumDiagnostics) error {
+	return m.updateRecord(ctx, id, func(record *Record) {
+		if record.RouteDiagnostics == nil {
+			record.RouteDiagnostics = &RouteDiagnostics{}
+		}
+		record.RouteDiagnostics.FusionQuorum = cloneFusionQuorumDiagnostics(&quorum)
+	})
+}
+
 func (m *MilvusStore) updateRecord(ctx context.Context, id string, mutate func(*Record)) error {
 	return m.updateRecordIf(ctx, id, func(record *Record) bool {
 		mutate(record)

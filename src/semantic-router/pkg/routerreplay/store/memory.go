@@ -243,6 +243,23 @@ func (m *MemoryStore) UpdateToolTrace(ctx context.Context, id string, trace Tool
 	return nil
 }
 
+// UpdateFusionQuorum updates fusion quorum diagnostics for an existing record.
+func (m *MemoryStore) UpdateFusionQuorum(ctx context.Context, id string, quorum FusionQuorumDiagnostics) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rec, ok := m.byID[id]
+	if !ok {
+		return fmt.Errorf("record with ID %s not found", id)
+	}
+
+	if rec.RouteDiagnostics == nil {
+		rec.RouteDiagnostics = &RouteDiagnostics{}
+	}
+	rec.RouteDiagnostics.FusionQuorum = cloneFusionQuorumDiagnostics(&quorum)
+	return nil
+}
+
 // Close is a no-op for memory storage.
 func (m *MemoryStore) Close() error {
 	return nil

@@ -74,8 +74,11 @@ const (
 // Envoy over gRPC: the native gateway takes the same override from
 // routing.Call.Reliability, so its requests never carry these headers.
 func (r *OpenAIRouter) addEnvoyReliabilityHeaders(response *ext_proc.ProcessingResponse, ctx *RequestContext) {
+	if ctx == nil || response == nil || response.GetImmediateResponse() != nil {
+		return
+	}
 	override := callReliability(ctx.VSRSelectedDecision)
-	if override == nil || response == nil || response.GetImmediateResponse() != nil {
+	if override == nil && !ctx.LooperStreamingActive {
 		return
 	}
 	// The route mutation travels with the held header reply in full-duplex
@@ -101,7 +104,47 @@ func (r *OpenAIRouter) addEnvoyReliabilityHeaders(response *ext_proc.ProcessingR
 	if route == "" {
 		route = ctx.backendModelForCandidate(ctx.VSRSelectedModel)
 	}
-	mutation.SetHeaders = append(mutation.SetHeaders, envoyReliabilityHeaders(override, r.routeHasRetryPolicy(route))...)
+
+	configuredRetries := 0
+	if r != nil && r.Config != nil {
+		if modelCfg, ok := r.Config.ModelConfig[route]; ok {
+			configuredRetries = modelCfg.Reliability.RetryCount
+		}
+	}
+	if override != nil && override.RetryCount != nil {
+		configuredRetries = *override.RetryCount
+	}
+
+	var finalRetries int
+	if ctx.LooperStreamingActive {
+		maxAllowed := max(0, ctx.LooperRemainingBudget-1)
+		finalRetries = min(configuredRetries, maxAllowed)
+		if override != nil {
+			override.RetryCount = &finalRetries
+		}
+	}
+
+	if override != nil {
+		mutation.SetHeaders = append(mutation.SetHeaders, envoyReliabilityHeaders(override, r.routeHasRetryPolicy(route))...)
+	}
+	if ctx.LooperStreamingActive {
+		setEnvoyHeader(mutation, envoyMaxRetriesHeader, strconv.Itoa(finalRetries))
+	}
+}
+
+func setEnvoyHeader(mutation *ext_proc.HeaderMutation, key, value string) {
+	for _, option := range mutation.SetHeaders {
+		if option.Header != nil && strings.EqualFold(option.Header.Key, key) {
+			option.Header.RawValue = []byte(value)
+			option.Header.Value = ""
+			option.AppendAction = core.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD
+			return
+		}
+	}
+	mutation.SetHeaders = append(mutation.SetHeaders, &core.HeaderValueOption{
+		Header:       &core.HeaderValue{Key: key, RawValue: []byte(value)},
+		AppendAction: core.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+	})
 }
 
 // envoyReliabilityHeaders renders an override as Envoy's per-request

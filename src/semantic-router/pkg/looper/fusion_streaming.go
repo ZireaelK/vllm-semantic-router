@@ -61,10 +61,7 @@ func (l *FusionLooper) PrepareStreamingSynthesis(
 
 	groundedPanel, groundingScores, groundingMode, err := l.applyGrounding(ctx, req, cfg, panel.responses)
 	if err != nil {
-		if !panel.usage.IsZero() {
-			return nil, newFusionPanelStageError(err, panel, panel.usage, len(panel.dispatchedModels))
-		}
-		return nil, err
+		return nil, newFusionPanelStageError(err, panel, panel.usage, len(panel.dispatchedModels))
 	}
 
 	panelAttempts := len(panel.dispatchedModels)
@@ -87,10 +84,7 @@ func (l *FusionLooper) PrepareStreamingSynthesis(
 			intermediateUsage = intermediateUsage.Add(analysisResp)
 		}
 		if analysisErr != nil {
-			if !intermediateUsage.IsZero() {
-				return nil, newFusionPanelStageError(analysisErr, panel, intermediateUsage, panelAttempts+1, cfg.Model)
-			}
-			return nil, analysisErr
+			return nil, newFusionPanelStageError(analysisErr, panel, intermediateUsage, panelAttempts+1, cfg.Model)
 		}
 		iterations++
 
@@ -111,10 +105,7 @@ func (l *FusionLooper) PrepareStreamingSynthesis(
 
 	default:
 		unsupportedErr := fmt.Errorf("unsupported fusion analysis_mode %q", cfg.AnalysisMode)
-		if !intermediateUsage.IsZero() {
-			return nil, newFusionPanelStageError(unsupportedErr, panel, intermediateUsage, panelAttempts)
-		}
-		return nil, unsupportedErr
+		return nil, newFusionPanelStageError(unsupportedErr, panel, intermediateUsage, panelAttempts)
 	}
 
 	finalReq := appendFusionStageMessage(req.OriginalRequest, prompt)
@@ -131,10 +122,7 @@ func (l *FusionLooper) PrepareStreamingSynthesis(
 		stageAdditionalModels = []string{cfg.Model}
 	}
 	if err := capLooperStageOutput(req, finalReq); err != nil {
-		if !intermediateUsage.IsZero() {
-			return nil, newFusionPanelStageError(err, panel, intermediateUsage, iterations, stageAdditionalModels...)
-		}
-		return nil, err
+		return nil, newFusionPanelStageError(err, panel, intermediateUsage, iterations, stageAdditionalModels...)
 	}
 	if req != nil && req.ToolStageGate != nil && (len(finalReq.Tools) > 0 || len(finalReq.Functions) > 0) {
 		if gated := req.ToolStageGate(llmprotocol.TrustedStageFinal, finalReq); gated != nil {
@@ -142,10 +130,7 @@ func (l *FusionLooper) PrepareStreamingSynthesis(
 		}
 	}
 	if err := validateLooperStageContext(req, finalReq, cfg.Model); err != nil {
-		if !intermediateUsage.IsZero() {
-			return nil, newFusionPanelStageError(err, panel, intermediateUsage, iterations, stageAdditionalModels...)
-		}
-		return nil, err
+		return nil, newFusionPanelStageError(err, panel, intermediateUsage, iterations, stageAdditionalModels...)
 	}
 
 	trace := buildFusionTrace(cfg, groundedPanel, panel.failedModels, analysis, groundingMode, groundingScores)
@@ -178,7 +163,7 @@ func (l *FusionLooper) applyStreamingQuorumFailurePolicy(
 
 	if ctxErr := fusionCallerBudgetErr(ctx); ctxErr != nil {
 		l.logQuorumDecision(req, cfg, evidence, FusionQuorumCancelled, "")
-		return nil, quorumErr.WithPolicyOutcome(policy, "", FusionQuorumCancelled, evidence.Usage)
+		return nil, fmt.Errorf("%w: %w", ctxErr, quorumErr.WithPolicyOutcome(policy, "", FusionQuorumCancelled, evidence.Usage))
 	}
 
 	if cfg.QuorumFailurePolicy != config.FusionQuorumFailurePolicyFallback {
@@ -231,8 +216,8 @@ func (l *FusionLooper) applyStreamingQuorumFailurePolicy(
 	if err := validateLooperStageContext(req, fallbackReq, target); err != nil {
 		disposition := fusionQuorumFallbackDisposition(ctx, err)
 		l.logQuorumDecision(req, cfg, evidence, disposition, target)
-		return nil, fmt.Errorf("validate fallback stage context: %w",
-			quorumErr.WithPolicyOutcome(policy, target, disposition, evidence.Usage))
+		return nil, fmt.Errorf("validate fallback stage context: %w: %w",
+			err, quorumErr.WithPolicyOutcome(policy, target, disposition, evidence.Usage))
 	}
 
 	modelsUsed := append(append([]string{}, panel.dispatchedModels...), target)

@@ -154,3 +154,115 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+// TestPostgresUpdateFusionQuorumQueryTemplate verifies that UpdateFusionQuorum
+// generates an UPDATE query protected against both SQL NULL and JSONB 'null' literals.
+//
+// In PostgreSQL, uninitialized RouteDiagnostics records store JSONB literal 'null'::jsonb
+// because typed nil pointers marshal to JSON "null". A naive COALESCE(route_diagnostics, '{}'::jsonb)
+// evaluates 'null'::jsonb as non-null, causing jsonb_set to fail with "cannot call jsonb_set on a scalar".
+//
+// Normalizing via COALESCE(NULLIF(route_diagnostics, 'null'::jsonb), '{}'::jsonb) maps 'null'::jsonb
+// to SQL NULL, which COALESCE safely converts to an empty JSONB object '{}'::jsonb before calling jsonb_set.
+func TestPostgresUpdateFusionQuorumQueryTemplate(t *testing.T) {
+	const tableName = "test_router_replay"
+	query := postgresUpdateFusionQuorumQuery(tableName)
+
+	if !strings.Contains(query, "UPDATE "+tableName) {
+		t.Errorf("query does not target expected table %q: %s", tableName, query)
+	}
+
+	const expectedNullNormalization = "COALESCE(NULLIF(route_diagnostics, 'null'::jsonb), '{}'::jsonb)"
+	if !strings.Contains(query, expectedNullNormalization) {
+		t.Errorf("query does not normalize JSON 'null' to empty object;\nwant substring: %s\ngot query:\n%s",
+			expectedNullNormalization, query)
+	}
+
+	// Verify the naive COALESCE without NULLIF is not present.
+	naiveCoalesce := "COALESCE(route_diagnostics, '{}'::jsonb)"
+	if strings.Contains(query, naiveCoalesce) {
+		t.Errorf("query contains unsafe naive COALESCE without NULLIF guard: %s", query)
+	}
+
+	for _, expectedClause := range []string{
+		"route_diagnostics = jsonb_set(",
+		"'{fusion_quorum}'",
+		"$2::jsonb",
+		"true",
+		"WHERE id = $1",
+	} {
+		if !strings.Contains(query, expectedClause) {
+			t.Errorf("query missing expected clause %q:\n%s", expectedClause, query)
+		}
+	}
+}
+
+// TestPostgresRouteDiagnosticsTypedNilMarshalingContract pins the encoding contract
+// between Go typed nil pointers (*RouteDiagnostics), JSON marshaling, and PostgreSQL JSONB storage:
+//
+//  1. A Record with RouteDiagnostics == nil has a typed nil pointer (*RouteDiagnostics)(nil).
+//  2. Passing it to marshalReplayOptionalJSON(interface{}) yields interface{}((*RouteDiagnostics)(nil)).
+//     Because a typed nil interface is not nil, json.Marshal encodes it to []byte("null").
+//  3. PostgreSQL JSONB columns persist []byte("null") as JSON literal 'null'::jsonb (scalar, non-null in SQL).
+//  4. unmarshalReplayOptionalJSON decodes []byte("null") back to a nil pointer (preserving contract).
+//  5. When RouteDiagnostics is populated, it encodes to a JSON object.
+func TestPostgresRouteDiagnosticsTypedNilMarshalingContract(t *testing.T) {
+	// Case 1: uninitialized record with typed nil pointer (*RouteDiagnostics)(nil)
+	emptyRec := Record{
+		ID:        "test-uninit-route-diag",
+		Timestamp: time.Now().UTC(),
+	}
+	if emptyRec.RouteDiagnostics != nil {
+		t.Fatal("expected RouteDiagnostics to be nil initially")
+	}
+
+	insert, err := newPostgresInsertRecord(emptyRec)
+	if err != nil {
+		t.Fatalf("newPostgresInsertRecord: %v", err)
+	}
+
+	idx := columnIndex(t, "route_diagnostics")
+	args := insert.args()
+	if idx >= len(args) {
+		t.Fatalf("column index %d out of bounds for args (len %d)", idx, len(args))
+	}
+
+	diagArg, ok := args[idx].([]byte)
+	if !ok {
+		t.Fatalf("route_diagnostics arg is not []byte: %T (%v)", args[idx], args[idx])
+	}
+
+	// Typed nil pointer marshals to JSON literal "null"
+	if string(diagArg) != "null" {
+		t.Fatalf("expected route_diagnostics arg to be []byte(\"null\") for typed nil, got %q", string(diagArg))
+	}
+
+	// Verify decoding: []byte("null") unmarshals back to nil RouteDiagnostics pointer
+	var decoded *RouteDiagnostics
+	if err := unmarshalReplayOptionalJSON(diagArg, &decoded); err != nil {
+		t.Fatalf("unmarshalReplayOptionalJSON failed: %v", err)
+	}
+	if decoded != nil {
+		t.Fatalf("expected unmarshaled RouteDiagnostics to be nil, got %+v", decoded)
+	}
+
+	// Case 2: populated record with non-nil RouteDiagnostics
+	populatedRec := Record{
+		ID:        "test-populated-route-diag",
+		Timestamp: time.Now().UTC(),
+		RouteDiagnostics: &RouteDiagnostics{
+			SelectionMethod: "fusion",
+		},
+	}
+	insertPopulated, err := newPostgresInsertRecord(populatedRec)
+	if err != nil {
+		t.Fatalf("newPostgresInsertRecord: %v", err)
+	}
+	populatedArg, ok := insertPopulated.args()[idx].([]byte)
+	if !ok {
+		t.Fatalf("populated route_diagnostics arg is not []byte: %T", insertPopulated.args()[idx])
+	}
+	if !strings.Contains(string(populatedArg), `"selection_method":"fusion"`) {
+		t.Fatalf("expected serialized JSON to contain selection_method, got %s", string(populatedArg))
+	}
+}
