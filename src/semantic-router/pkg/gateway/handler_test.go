@@ -805,3 +805,41 @@ func TestHandlerPropagatesSessionBudgetLedgerToUpstream(t *testing.T) {
 		t.Fatalf("expected ledger %v in upstream context, got %v (ok=%v)", ledger, gotLedger, ok)
 	}
 }
+
+func TestHandlerReportsOutcomeOnFallbackImmediate(t *testing.T) {
+	p := &fakeProcessor{}
+	u := &fakeUpstream{
+		immediate: &routing.Response{
+			Status: http.StatusServiceUnavailable,
+			Header: routing.Header{{Name: "content-type", Value: "application/json"}},
+			Body:   []byte(`{"error":"all backends unavailable"}`),
+		},
+	}
+	h, err := NewHandler(Options{
+		Serving: Static(Serving{Engine: routing.NewEngine(p, routing.DefaultOptions), Upstream: u}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.outcomes) != 1 {
+		t.Fatalf("expected 1 outcome reported, got %d", len(p.outcomes))
+	}
+	if p.outcomes[0].status != http.StatusServiceUnavailable || p.outcomes[0].err == nil {
+		t.Fatalf("outcome = %+v, want status 503 and non-nil error", p.outcomes[0])
+	}
+	if !strings.Contains(p.outcomes[0].err.Error(), "503") {
+		t.Fatalf("outcome err = %v, want error mentioning status 503", p.outcomes[0].err)
+	}
+	if len(p.closed) != 1 {
+		t.Fatalf("expected 1 close call, got %d", len(p.closed))
+	}
+}

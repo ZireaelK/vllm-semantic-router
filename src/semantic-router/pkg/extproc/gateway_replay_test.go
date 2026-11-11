@@ -272,3 +272,115 @@ func TestGatewayReplayClientCancel(t *testing.T) {
 		t.Errorf("replay TerminalReason = %q, want %q", record.TerminalReason, "client_canceled")
 	}
 }
+
+type mockImmediateUpstream struct {
+	result *upstream.Result
+}
+
+func (m *mockImmediateUpstream) Execute(ctx context.Context, call *routing.Call, listener string) (*upstream.Result, error) {
+	return m.result, nil
+}
+
+type sessionCapturingProcessor struct {
+	inner       routing.Processor
+	lastSession *routingSession
+}
+
+func (p *sessionCapturingProcessor) Open(ctx context.Context) (routing.Session, error) {
+	sess, err := p.inner.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if rs, ok := sess.(*routingSession); ok {
+		p.lastSession = rs
+	}
+	return sess, nil
+}
+
+func TestGatewayReplayFallbackImmediate(t *testing.T) {
+	cfgYAML := strings.Replace(gatewayReplayConfigTemplate, "{{ENDPOINT}}", "127.0.0.1:8000", 1)
+	cfgYAML = strings.Replace(cfgYAML, "{{TIMEOUT}}", "5s", 1)
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	router, err := NewOpenAIRouter(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = router.Close() })
+
+	mockUpstream := &mockImmediateUpstream{
+		result: &upstream.Result{
+			Immediate: &routing.Response{
+				Status: http.StatusServiceUnavailable,
+				Header: routing.Header{{Name: "content-type", Value: "application/json"}},
+				Body:   []byte(`{"error":"all backends unavailable"}`),
+			},
+		},
+	}
+
+	capturing := &sessionCapturingProcessor{inner: NewRouterService(router)}
+	opts := routing.DefaultOptions
+	opts.ExecutesFallback = true
+	handler, err := gateway.NewHandler(gateway.Options{
+		Serving: gateway.Static(gateway.Serving{
+			Engine:   routing.NewEngine(capturing, opts),
+			Upstream: mockUpstream,
+		}),
+		Listener: "http-8899",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqBody := `{"model":"primary-model","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	// 1) Downstream HTTP client receives 503 status
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("client status = %d (%s), want 503", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "all backends unavailable") {
+		t.Fatalf("unexpected body: %s", rec.Body.String())
+	}
+
+	// 2) ctx.UpstreamStatusCode is 503
+	if capturing.lastSession == nil || capturing.lastSession.ctx == nil {
+		t.Fatal("expected routingSession and RequestContext to be captured")
+	}
+	reqCtx := capturing.lastSession.ctx
+	if reqCtx.UpstreamStatusCode != http.StatusServiceUnavailable {
+		t.Errorf("ctx.UpstreamStatusCode = %d, want 503", reqCtx.UpstreamStatusCode)
+	}
+
+	// 3) Replay record in store has ResponseStatus == 503
+	record, found := getLatestReplayRecord(router)
+	if !found {
+		t.Fatal("expected replay record to be recorded, but found none")
+	}
+	if record.ResponseStatus != http.StatusServiceUnavailable {
+		t.Errorf("replay ResponseStatus = %d, want 503", record.ResponseStatus)
+	}
+
+	// 4) TerminalLifecycleState == routerreplay.LifecycleFailed
+	if reqCtx.TerminalLifecycleState != routerreplay.LifecycleFailed {
+		t.Errorf("ctx.TerminalLifecycleState = %q, want %q", reqCtx.TerminalLifecycleState, routerreplay.LifecycleFailed)
+	}
+	if record.LifecycleState != routerreplay.LifecycleFailed {
+		t.Errorf("replay LifecycleState = %q, want %q", record.LifecycleState, routerreplay.LifecycleFailed)
+	}
+
+	// 5) TerminalLifecycleReason == "upstream_error_response"
+	if reqCtx.TerminalLifecycleReason != "upstream_error_response" {
+		t.Errorf("ctx.TerminalLifecycleReason = %q, want %q", reqCtx.TerminalLifecycleReason, "upstream_error_response")
+	}
+	if record.TerminalReason != "upstream_error_response" {
+		t.Errorf("replay TerminalReason = %q, want %q", record.TerminalReason, "upstream_error_response")
+	}
+}

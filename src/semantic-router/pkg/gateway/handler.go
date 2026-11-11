@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
@@ -236,6 +237,12 @@ func (h *Handler) forward(ctx context.Context, serving Serving, plan *routing.Pl
 	x.record.UpstreamServiceTime = time.Since(sent)
 	if result.Immediate != nil {
 		// The fallback chain answered without a backend.
+		status := result.Immediate.Status
+		var outcomeErr error
+		if status >= 400 {
+			outcomeErr = fmt.Errorf("upstream fallback returned status %d", status)
+		}
+		plan.ReportOutcome(status, outcomeErr)
 		return result.Immediate, func() {}, nil
 	}
 	resp := result.Response

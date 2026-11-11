@@ -195,12 +195,16 @@ func (s *routingSession) Close(err error) {
 		// A chain the caller abandoned still leaves one audit record.
 		s.router.recordFallbackExecution(s.ctx)
 	}
-	if s.ctx != nil && s.ctx.PendingLooperQuorumOutcome != nil && s.ctx.TerminalLifecycleState != "" {
-		if s.router != nil {
+	if s.ctx != nil && !s.ctx.RouterReplayCommitted && s.router != nil && s.ctx.RouterReplayID != "" {
+		if s.ctx.PendingLooperQuorumOutcome != nil && s.ctx.TerminalLifecycleState != "" {
 			responsePrepared := (s.ctx.TerminalLifecycleState == routerreplay.LifecycleCompleted)
 			if qErr := finalizeLooperQuorumOutcome(s.ctx, s.ctx.PendingLooperQuorumOutcome, s.ctx.VSRSelectedDecision, responsePrepared); qErr == nil {
 				s.ctx.PendingLooperQuorumOutcome = nil
-				s.router.finalizeRouterReplay(s.ctx, s.ctx.TerminalLifecycleState, s.ctx.TerminalLifecycleReason)
+			}
+		}
+		if s.ctx.PendingLooperQuorumOutcome == nil && s.ctx.TerminalLifecycleState != "" {
+			s.router.finalizeRouterReplay(s.ctx, s.ctx.TerminalLifecycleState, s.ctx.TerminalLifecycleReason)
+			if s.ctx.RouterReplayCommitted {
 				s.router.emitRouterReplayComplete(s.ctx)
 			}
 		}
