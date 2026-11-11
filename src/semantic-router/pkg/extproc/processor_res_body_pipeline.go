@@ -17,6 +17,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing/budget"
 )
 
 func (r *OpenAIRouter) handleNonStreamingResponseBody(
@@ -116,16 +117,18 @@ func (r *OpenAIRouter) handleNonStreamingResponseBody(
 	if plan.blocked != nil {
 		if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
 			ctx.PendingLooperQuorumOutcome.Disposition = looper.FusionQuorumResponseEncodeFailed
-			finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
-			ctx.PendingLooperQuorumOutcome = nil
+			if err := finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false); err == nil {
+				ctx.PendingLooperQuorumOutcome = nil
+			}
 		}
 		plan.commit()
 		return plan.blocked
 	}
 
 	if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
-		finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, true)
-		ctx.PendingLooperQuorumOutcome = nil
+		if err := finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, true); err == nil {
+			ctx.PendingLooperQuorumOutcome = nil
+		}
 	}
 	plan.commit()
 
@@ -291,6 +294,24 @@ func (r *OpenAIRouter) prepareResponsePolicy(
 // plugin can block or rewrite it and none runs; the observation is all that is
 // still possible, and the record says so.
 func (r *OpenAIRouter) observeResponseStageSignals(ctx *RequestContext, assistantContent string) {
+	if ctx != nil && ctx.LooperStreamingActive && !ctx.IsNativeGateway && !ctx.EnvoyBudgetReserved {
+		targetCtx := ctx.TraceContext
+		if targetCtx == nil {
+			targetCtx = ctx.Context
+		}
+		if targetCtx != nil {
+			_ = budget.Consume(targetCtx)
+		}
+		ctx.EnvoyBudgetReserved = true
+		ctx.EnvoyAuthorizedAttempts = 1
+		checkCtx := targetCtx
+		if checkCtx == nil {
+			checkCtx = selectionRequestContext(ctx)
+		}
+		if currentLedger, ok := budget.Current(checkCtx); ok && currentLedger != nil {
+			ctx.LooperRemainingBudget = currentLedger.Remaining()
+		}
+	}
 	r.scoreResponseStageSignals(ctx, assistantContent)
 	r.recordRouterReplayResponseJailbreak(ctx)
 	r.recordRouterReplayHallucination(ctx)
@@ -558,8 +579,9 @@ func (r *OpenAIRouter) handleNonStreamingResponseError(
 	}
 	if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
 		ctx.PendingLooperQuorumOutcome.Disposition = looper.FusionQuorumResponseEncodeFailed
-		finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
-		ctx.PendingLooperQuorumOutcome = nil
+		if err := finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false); err == nil {
+			ctx.PendingLooperQuorumOutcome = nil
+		}
 	}
 	if ctx != nil && (ctx.LooperStreamingActive || ctx.LooperIntermediateUsage.TotalTokens > 0) && !ctx.LooperUsageSettled {
 		r.settleAbortedLooperStreamingUsage(ctx, err)

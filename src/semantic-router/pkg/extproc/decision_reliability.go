@@ -11,6 +11,7 @@ import (
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing/budget"
 )
 
 var _ routing.ReliabilitySession = (*routingSession)(nil)
@@ -228,22 +229,47 @@ func (r *OpenAIRouter) addEnvoyReliabilityHeaders(response *ext_proc.ProcessingR
 		}
 	}
 
-	configuredRetries := configuredRetriesFromDecisionOrModel(r, ctx, override, route)
-
-	var finalRetries int
-	if ctx.LooperStreamingActive {
-		maxAllowed := max(0, ctx.LooperRemainingBudget-1)
-		finalRetries = min(configuredRetries, maxAllowed)
-		if override != nil {
-			override.RetryCount = &finalRetries
-		}
-	}
-
 	if override != nil {
 		mutation.SetHeaders = append(mutation.SetHeaders, envoyReliabilityHeaders(override, r.routeHasRetryPolicy(route))...)
 	}
-	if ctx.LooperStreamingActive {
+
+	if ctx.LooperStreamingActive && !ctx.IsNativeGateway && !ctx.EnvoyBudgetReserved {
+		configuredRetries := configuredRetriesFromDecisionOrModel(r, ctx, override, route)
+		maxAllowed := max(0, ctx.LooperRemainingBudget-1)
+		finalRetries := min(configuredRetries, maxAllowed)
+		requestedAttempts := 1 + finalRetries
+
+		targetCtx := ctx.TraceContext
+		if targetCtx == nil {
+			targetCtx = ctx.Context
+		}
+		if targetCtx == nil {
+			targetCtx = selectionRequestContext(ctx)
+		}
+
+		reservedAttempts := requestedAttempts
+		if targetCtx != nil {
+			if ledger, ok := budget.Current(targetCtx); ok && ledger != nil {
+				debited := 0
+				for i := 0; i < requestedAttempts; i++ {
+					if err := budget.Consume(targetCtx); err == nil {
+						debited++
+					} else {
+						break
+					}
+				}
+				reservedAttempts = debited
+				finalRetries = max(0, reservedAttempts-1)
+				ctx.LooperRemainingBudget = ledger.Remaining()
+			}
+		}
+
+		if override != nil {
+			override.RetryCount = &finalRetries
+		}
 		setEnvoyHeader(mutation, envoyMaxRetriesHeader, strconv.Itoa(finalRetries))
+		ctx.EnvoyBudgetReserved = true
+		ctx.EnvoyAuthorizedAttempts = reservedAttempts
 	}
 }
 

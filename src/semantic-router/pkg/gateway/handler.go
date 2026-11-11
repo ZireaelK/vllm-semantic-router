@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing/budget"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/upstream"
 )
 
@@ -218,6 +219,9 @@ func (h *Handler) serve(ctx context.Context, w http.ResponseWriter, serving Serv
 // on Envoy's own local replies, so behind Envoy the client gets the reply as
 // it is, and the session ends as the ext_proc stream then does.
 func (h *Handler) forward(ctx context.Context, serving Serving, plan *routing.Plan, x *exchange) (*routing.Response, func(), error) {
+	if plan != nil && plan.Call != nil && plan.Call.Ledger != nil {
+		ctx = budget.WithLedger(ctx, plan.Call.Ledger)
+	}
 	sent := time.Now()
 	result, err := serving.Upstream.Execute(ctx, plan.Call, h.opts.Listener)
 	if err != nil {

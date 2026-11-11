@@ -40,6 +40,9 @@ type Result struct {
 // own failed response, whole, as Envoy passes the primary's response on when
 // the router's response-phase fallback runs out.
 func (s *Set) Execute(ctx context.Context, call *routing.Call, listener string) (*Result, error) {
+	if call != nil && call.Ledger != nil {
+		ctx = budget.WithLedger(ctx, call.Ledger)
+	}
 	fallback := call.Fallback
 	var primary *Response
 	started := time.Now()

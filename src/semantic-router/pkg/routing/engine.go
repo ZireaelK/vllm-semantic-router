@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/headers"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing/budget"
 )
 
 // RouteHeader is the request header whose value selects the upstream route:
@@ -62,6 +63,9 @@ type Call struct {
 	// this call, lowest first: the decision's, then a request-graph step's.
 	// Each merges over the ones before it; none keeps the provider model's.
 	Reliability []*Reliability
+	// Ledger bounds physical model calls for this request across primary
+	// attempts and retries.
+	Ledger *budget.Ledger
 }
 
 // Budget bounds the work for one request.
@@ -216,6 +220,9 @@ func (e *engine) Plan(ctx context.Context, req *Request) (*Plan, error) {
 			if override := reliabilitySession.Reliability(); override != nil {
 				plan.Call.Reliability = []*Reliability{override}
 			}
+		}
+		if budgetSession, ok := session.(BudgetSession); ok {
+			plan.Call.Ledger = budgetSession.BudgetLedger()
 		}
 	}
 	return plan, nil

@@ -175,6 +175,7 @@ func (r *OpenAIRouter) handleProcessReceiveError(ctx *RequestContext, err error)
 	defaultState, defaultReason := replayLifecycleForReceiveError(err)
 	state, reason := resolveReplayLifecycleState(ctx, err, defaultState, defaultReason)
 	r.finalizeRouterReplay(ctx, state, reason)
+	r.emitRouterReplayComplete(ctx)
 
 	if errors.Is(err, io.EOF) {
 		logging.Debugf("Stream ended gracefully")
@@ -264,13 +265,17 @@ func (r *OpenAIRouter) settleAbortedLooperStreamingUsage(ctx *RequestContext, er
 		return
 	}
 	if ctx.PendingLooperQuorumOutcome != nil {
-		disposition := looper.FusionQuorumResponseEncodeFailed
-		if isLooperCancellation(ctx, err) {
-			disposition = looper.FusionQuorumCancelled
+		responsePrepared := (ctx.TerminalLifecycleState == routerreplay.LifecycleCompleted)
+		if !responsePrepared && !ctx.PendingLooperQuorumOutcome.Disposition.IsTerminal() {
+			disposition := looper.FusionQuorumResponseEncodeFailed
+			if isLooperCancellation(ctx, err) {
+				disposition = looper.FusionQuorumCancelled
+			}
+			ctx.PendingLooperQuorumOutcome.Disposition = disposition
 		}
-		ctx.PendingLooperQuorumOutcome.Disposition = disposition
-		finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
-		ctx.PendingLooperQuorumOutcome = nil
+		if qErr := finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, responsePrepared); qErr == nil {
+			ctx.PendingLooperQuorumOutcome = nil
+		}
 	}
 	if !ctx.LooperStreamingActive || ctx.LooperUsageSettled {
 		return

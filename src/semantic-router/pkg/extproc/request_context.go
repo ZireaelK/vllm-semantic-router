@@ -147,6 +147,8 @@ type RequestContext struct {
 	FullDuplexRequestBody bool // true when the data plane negotiated FULL_DUPLEX_STREAMED
 	SkipProcessing        bool // true only when the configured opt-out header is valid
 	BufferedRequestBody   bool // true when the data plane negotiated BUFFERED or BUFFERED_PARTIAL
+	// IsNativeGateway is true when the request is processed via native gateway routing session rather than Envoy ext_proc.
+	IsNativeGateway bool
 	// Arrival diagnostics, set at end of stream in STREAMED modes only.
 	StreamedBodyStats StreamedBodyStats
 
@@ -412,12 +414,13 @@ type RequestContext struct {
 	preparedDispatchReceipt *routerreplay.PreparedDispatchReceipt
 
 	// Router replay context
-	RouterReplayID           string                           // ID of the router replay session, if applicable
-	RouterReplayPluginConfig *config.RouterReplayPluginConfig // Per-decision plugin configuration for router replay
-	RouterReplayRecorder     *routerreplay.Recorder           // The recorder instance for this decision
-	RouterReplayCommitted    bool                             // True once a terminal lifecycle state is committed
-	TerminalLifecycleState   string                           // Initial selected terminal state (e.g. LifecycleCompleted, LifecycleFailed)
-	TerminalLifecycleReason  string                           // Initial selected terminal reason (e.g. response_decode_failed, stream_completed)
+	RouterReplayID             string                           // ID of the router replay session, if applicable
+	RouterReplayPluginConfig   *config.RouterReplayPluginConfig // Per-decision plugin configuration for router replay
+	RouterReplayRecorder       *routerreplay.Recorder           // The recorder instance for this decision
+	RouterReplayCommitted      bool                             // True once a terminal lifecycle state is committed
+	RouterReplayCompleteLogged bool                             // True once router_replay_complete event has been emitted
+	TerminalLifecycleState     string                           // Initial selected terminal state (e.g. LifecycleCompleted, LifecycleFailed)
+	TerminalLifecycleReason    string                           // Initial selected terminal reason (e.g. response_decode_failed, stream_completed)
 	// RouterReplayContentOmitted records prompt omission. Response/tool capture
 	// separately checks stage-specific evidence and the resolved capture policy.
 	RouterReplayContentOmitted bool
@@ -437,6 +440,8 @@ type RequestContext struct {
 	LooperLogprobs              *looperLogprobOptions       // Native Chat evidence requested by an authenticated internal hop
 	LooperStreamingActive       bool                        // True when a native streaming final stage is dispatched through Envoy
 	LooperRemainingBudget       int                         // Remaining upstream physical call budget for the dispatched final stage
+	EnvoyBudgetReserved         bool                        // True when final synthesis call budget has been pre-reserved before Envoy dispatch
+	EnvoyAuthorizedAttempts     int                         // Number of physical exchange attempts pre-reserved for Envoy dispatch
 	LooperTargetModel           string                      // Physical target model executing the streamed final stage
 	LooperSynthesisTextBytes    int                         // Semantic text bytes of the dispatched synthesis request for token calibration
 	LooperSynthesisPromptTokens int                         // Known or estimated prompt tokens of the dispatched synthesis request
@@ -447,6 +452,7 @@ type RequestContext struct {
 	LooperAuditedOutputTokens   int                         // Estimated output tokens audited from SSE deltas before disconnect
 	LooperUsageSettled          bool                        // True once terminal or aborted Looper streaming usage has been settled
 	PendingLooperQuorumOutcome  *looper.FusionQuorumOutcome // Bounded Fusion quorum fallback outcome awaiting response completion
+	LooperQuorumMetricsRecorded bool                        // True once terminal Looper quorum metrics and events have been emitted
 
 	// ListenerModels, when set, are the only request models the listener the
 	// client request arrived on accepts.

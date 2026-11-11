@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing/budget"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/upstream"
 )
 
@@ -36,14 +37,29 @@ type fakeProcessor struct {
 	planFail error
 	models   []routing.ListenerModels
 	outcomes []fakeOutcome
+	ledger   *budget.Ledger
 }
 
 func (p *fakeProcessor) Open(ctx context.Context) (routing.Session, error) {
 	models, _ := routing.ListenerModelsFrom(ctx)
 	p.mu.Lock()
 	p.models = append(p.models, models)
+	ledger := p.ledger
 	p.mu.Unlock()
-	return &fakeSession{p: p}, nil
+	sess := &fakeSession{p: p}
+	if ledger != nil {
+		return &fakeBudgetSession{fakeSession: sess, ledger: ledger}, nil
+	}
+	return sess, nil
+}
+
+type fakeBudgetSession struct {
+	*fakeSession
+	ledger *budget.Ledger
+}
+
+func (s *fakeBudgetSession) BudgetLedger() *budget.Ledger {
+	return s.ledger
 }
 
 type fakeSession struct{ p *fakeProcessor }
@@ -102,14 +118,16 @@ func (s *fakeSession) Close(err error) {
 type fakeUpstream struct {
 	mu        sync.Mutex
 	got       []*upstream.Request
+	gotCtx    []context.Context
 	resp      func() *upstream.Response
 	immediate *routing.Response
 	err       error
 }
 
-func (u *fakeUpstream) Execute(_ context.Context, call *routing.Call, listener string) (*upstream.Result, error) {
+func (u *fakeUpstream) Execute(ctx context.Context, call *routing.Call, listener string) (*upstream.Result, error) {
 	u.mu.Lock()
 	u.got = append(u.got, upstream.RequestFromCall(call, listener))
+	u.gotCtx = append(u.gotCtx, ctx)
 	u.mu.Unlock()
 	if u.err != nil {
 		return nil, u.err
@@ -749,5 +767,41 @@ func TestHandlerReportsOutcomeOnUpstreamExecuteError(t *testing.T) {
 	}
 	if p.outcomes[0].status != 504 || !errors.Is(p.outcomes[0].err, dialErr) {
 		t.Fatalf("outcome = %+v, want status 504 and dialErr", p.outcomes[0])
+	}
+}
+
+func TestHandlerPropagatesSessionBudgetLedgerToUpstream(t *testing.T) {
+	_, ledger := budget.WithLimit(context.Background(), 32)
+	p := &fakeProcessor{ledger: ledger}
+	u := &fakeUpstream{
+		resp: func() *upstream.Response {
+			return &upstream.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"choices":[]}`)),
+			}
+		},
+	}
+	h, err := NewHandler(Options{
+		Serving: Static(Serving{Engine: routing.NewEngine(p, routing.DefaultOptions), Upstream: u}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if len(u.gotCtx) != 1 {
+		t.Fatalf("expected 1 upstream call, got %d", len(u.gotCtx))
+	}
+	gotLedger, ok := budget.Current(u.gotCtx[0])
+	if !ok || gotLedger != ledger {
+		t.Fatalf("expected ledger %v in upstream context, got %v (ok=%v)", ledger, gotLedger, ok)
 	}
 }

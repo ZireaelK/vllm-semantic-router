@@ -603,8 +603,9 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 		})
 		r.recordUnscheduledResponseMemoryStore(ctx, "skipped", "stream_incomplete", true)
 		if ctx.PendingLooperQuorumOutcome != nil {
-			finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
-			ctx.PendingLooperQuorumOutcome = nil
+			if err := finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false); err == nil {
+				ctx.PendingLooperQuorumOutcome = nil
+			}
 		}
 		return
 	}
@@ -619,8 +620,9 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 		})
 		r.recordUnscheduledResponseMemoryStore(ctx, "skipped", "stream_encode_failed", true)
 		if ctx.PendingLooperQuorumOutcome != nil {
-			finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
-			ctx.PendingLooperQuorumOutcome = nil
+			if err := finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false); err == nil {
+				ctx.PendingLooperQuorumOutcome = nil
+			}
 		}
 		return
 	}
@@ -630,13 +632,16 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 	r.updateKVAddressRegistry(ctx)
 
 	if ctx.PendingLooperQuorumOutcome != nil {
+		var quorumErr error
 		if ctx.StreamingAborted {
 			ctx.PendingLooperQuorumOutcome.Disposition = looper.FusionQuorumResponseEncodeFailed
-			finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
+			quorumErr = finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
 		} else {
-			finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, true)
+			quorumErr = finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, true)
 		}
-		ctx.PendingLooperQuorumOutcome = nil
+		if quorumErr == nil {
+			ctx.PendingLooperQuorumOutcome = nil
+		}
 	}
 
 	r.scheduleSemanticResponseMemoryStore(ctx, semanticResponse)

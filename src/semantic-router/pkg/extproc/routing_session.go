@@ -15,6 +15,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing/budget"
 )
 
 // A routing session runs the phase logic an ext_proc stream runs and ends
@@ -25,6 +26,7 @@ var (
 	_ routing.Processor       = (*RouterService)(nil)
 	_ routing.Processor       = (*OpenAIRouter)(nil)
 	_ routing.OutcomeReporter = (*routingSession)(nil)
+	_ routing.BudgetSession   = (*routingSession)(nil)
 )
 
 var errSessionEnded = errors.New("routing session has ended")
@@ -74,7 +76,8 @@ func (r *OpenAIRouter) newRoutingSession(ctx context.Context, release func()) *r
 		ctx: &RequestContext{
 			Context: ctx,
 			Headers: make(map[string]string), TraceContext: ctx, BufferedRequestBody: true,
-			ConfigVersion: r.configVersion.Load(),
+			ConfigVersion:   r.configVersion.Load(),
+			IsNativeGateway: true,
 		},
 	}
 	if hop, ok := routing.HopFrom(ctx); ok {
@@ -150,6 +153,23 @@ func (s *routingSession) Evidence() routing.Evidence {
 	return routingEvidence(s.ctx)
 }
 
+func (s *routingSession) BudgetLedger() *budget.Ledger {
+	if s == nil || s.ctx == nil {
+		return nil
+	}
+	if s.ctx.TraceContext != nil {
+		if l, ok := budget.Current(s.ctx.TraceContext); ok {
+			return l
+		}
+	}
+	if s.ctx.Context != nil {
+		if l, ok := budget.Current(s.ctx.Context); ok {
+			return l
+		}
+	}
+	return nil
+}
+
 // ReportOutcome records the terminal upstream status and error for local replies
 // or errors that bypass the response phases.
 func (s *routingSession) ReportOutcome(status int, err error) {
@@ -174,6 +194,16 @@ func (s *routingSession) Close(err error) {
 	if s.fallback != nil {
 		// A chain the caller abandoned still leaves one audit record.
 		s.router.recordFallbackExecution(s.ctx)
+	}
+	if s.ctx != nil && s.ctx.PendingLooperQuorumOutcome != nil && s.ctx.TerminalLifecycleState != "" {
+		if s.router != nil {
+			responsePrepared := (s.ctx.TerminalLifecycleState == routerreplay.LifecycleCompleted)
+			if qErr := finalizeLooperQuorumOutcome(s.ctx, s.ctx.PendingLooperQuorumOutcome, s.ctx.VSRSelectedDecision, responsePrepared); qErr == nil {
+				s.ctx.PendingLooperQuorumOutcome = nil
+				s.router.finalizeRouterReplay(s.ctx, s.ctx.TerminalLifecycleState, s.ctx.TerminalLifecycleReason)
+				s.router.emitRouterReplayComplete(s.ctx)
+			}
+		}
 	}
 	if s.ended {
 		return

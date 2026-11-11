@@ -473,6 +473,24 @@ func (r *OpenAIRouter) finalizeRouterReplay(
 		ctx.TerminalLifecycleReason = reason
 	}
 
+	if ctx.PendingLooperQuorumOutcome != nil {
+		responsePrepared := (ctx.TerminalLifecycleState == routerreplay.LifecycleCompleted)
+		if err := finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, responsePrepared); err != nil {
+			// CRITICAL: Whatever the intended terminal state is (completed, failed, aborted),
+			// if required Quorum diagnostics failed to persist, we must NOT finalize the lifecycle
+			// and must NOT mark committed! Return early to retain pending outcome and terminal intent for cleanup retry.
+			logging.ComponentWarnEvent("extproc", "router_replay_quorum_pending_persistence_barrier", map[string]interface{}{
+				"request_id": ctx.RequestID,
+				"replay_id":  ctx.RouterReplayID,
+				"state":      ctx.TerminalLifecycleState,
+				"reason":     ctx.TerminalLifecycleReason,
+				"error":      err.Error(),
+			})
+			return
+		}
+		ctx.PendingLooperQuorumOutcome = nil
+	}
+
 	recorder := ctx.RouterReplayRecorder
 	if recorder == nil {
 		recorder = r.ReplayRecorder
@@ -534,13 +552,42 @@ func (r *OpenAIRouter) attachRouterReplayResponse(ctx *RequestContext, responseB
 			reason = "upstream_stream_incomplete"
 		}
 		r.finalizeRouterReplay(ctx, state, reason)
-		if rec, ok := recorder.GetRecord(ctx.RouterReplayID); ok {
-			logging.ComponentEvent(
-				"extproc",
-				"router_replay_complete",
-				routerreplay.LogFields(rec, "router_replay_complete"),
-			)
+		if ctx.RouterReplayCommitted {
+			r.emitRouterReplayComplete(ctx)
 		}
+	}
+}
+
+func (r *OpenAIRouter) emitRouterReplayComplete(ctx *RequestContext) {
+	if ctx == nil || ctx.RouterReplayID == "" || ctx.RouterReplayCompleteLogged {
+		return
+	}
+	if ctx.PendingLooperQuorumOutcome != nil {
+		logging.ComponentWarnEvent("extproc", "router_replay_quorum_persistence_failed_uncommitted", map[string]interface{}{
+			"request_id": ctx.RequestID,
+			"replay_id":  ctx.RouterReplayID,
+			"state":      ctx.TerminalLifecycleState,
+			"reason":     ctx.TerminalLifecycleReason,
+		})
+		return
+	}
+	if !ctx.RouterReplayCommitted {
+		return
+	}
+	recorder := ctx.RouterReplayRecorder
+	if recorder == nil {
+		recorder = r.ReplayRecorder
+	}
+	if recorder == nil {
+		return
+	}
+	if rec, ok := recorder.GetRecord(ctx.RouterReplayID); ok {
+		logging.ComponentEvent(
+			"extproc",
+			"router_replay_complete",
+			routerreplay.LogFields(rec, "router_replay_complete"),
+		)
+		ctx.RouterReplayCompleteLogged = true
 	}
 }
 

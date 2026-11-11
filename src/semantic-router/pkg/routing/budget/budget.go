@@ -78,3 +78,27 @@ func (l *Ledger) Used() int { return int(l.used.Load()) }
 
 // Remaining reports the number of additional exchanges the request can afford.
 func (l *Ledger) Remaining() int { return int(l.limit - l.used.Load()) }
+
+// Release restores n unused exchanges back to the ledger.
+func (l *Ledger) Release(n int) {
+	if l == nil || n <= 0 {
+		return
+	}
+	for {
+		used := l.used.Load()
+		newUsed := max(0, used-int64(n))
+		if l.used.CompareAndSwap(used, newUsed) {
+			return
+		}
+	}
+}
+
+// Release restores n unused exchanges back to the ledger carried by ctx.
+func Release(ctx context.Context, n int) {
+	if ctx == nil || n <= 0 {
+		return
+	}
+	if ledger, ok := ctx.Value(contextKey{}).(*Ledger); ok && ledger != nil {
+		ledger.Release(n)
+	}
+}

@@ -41,9 +41,9 @@ func finalizeLooperQuorumOutcome(
 	outcome *looper.FusionQuorumOutcome,
 	decision *config.Decision,
 	responsePrepared bool,
-) {
+) error {
 	if reqCtx == nil || outcome == nil {
-		return
+		return nil
 	}
 	if !outcome.Disposition.IsTerminal() {
 		outcome.Disposition = looper.FusionQuorumFallbackServed
@@ -52,24 +52,27 @@ func finalizeLooperQuorumOutcome(
 		}
 	}
 
-	metrics.RecordFusionQuorumFailure(metrics.FusionQuorumOutcome{
-		Decision:       decisionName(decision),
-		Policy:         outcome.SelectedPolicy,
-		Disposition:    string(outcome.Disposition),
-		FallbackTarget: outcome.FallbackTarget,
-		RequiredCount:  outcome.RequiredCount,
-		UsableCount:    outcome.UsableCount,
-		AttemptStates:  outcome.AttemptStates(),
-	})
-	logging.ComponentEvent("extproc", "fusion_quorum_terminal_outcome", map[string]interface{}{
-		"request_id":      reqCtx.RequestID,
-		"decision":        decisionName(decision),
-		"required_count":  outcome.RequiredCount,
-		"usable_count":    outcome.UsableCount,
-		"selected_policy": outcome.SelectedPolicy,
-		"fallback_target": outcome.FallbackTarget,
-		"disposition":     string(outcome.Disposition),
-	})
+	if !reqCtx.LooperQuorumMetricsRecorded {
+		metrics.RecordFusionQuorumFailure(metrics.FusionQuorumOutcome{
+			Decision:       decisionName(decision),
+			Policy:         outcome.SelectedPolicy,
+			Disposition:    string(outcome.Disposition),
+			FallbackTarget: outcome.FallbackTarget,
+			RequiredCount:  outcome.RequiredCount,
+			UsableCount:    outcome.UsableCount,
+			AttemptStates:  outcome.AttemptStates(),
+		})
+		logging.ComponentEvent("extproc", "fusion_quorum_terminal_outcome", map[string]interface{}{
+			"request_id":      reqCtx.RequestID,
+			"decision":        decisionName(decision),
+			"required_count":  outcome.RequiredCount,
+			"usable_count":    outcome.UsableCount,
+			"selected_policy": outcome.SelectedPolicy,
+			"fallback_target": outcome.FallbackTarget,
+			"disposition":     string(outcome.Disposition),
+		})
+		reqCtx.LooperQuorumMetricsRecorded = true
+	}
 	reqCtx.VSRFusionQuorum = looperQuorumOutcomeDiagnostics(outcome)
 	if reqCtx.RouterReplayRecorder != nil && reqCtx.RouterReplayID != "" && reqCtx.VSRFusionQuorum != nil {
 		if err := reqCtx.RouterReplayRecorder.UpdateFusionQuorum(reqCtx.RouterReplayID, *reqCtx.VSRFusionQuorum); err != nil {
@@ -78,8 +81,10 @@ func finalizeLooperQuorumOutcome(
 				"replay_id":  reqCtx.RouterReplayID,
 				"error":      err.Error(),
 			})
+			return err
 		}
 	}
+	return nil
 }
 
 func decisionName(decision *config.Decision) string {

@@ -64,8 +64,9 @@ func (r *OpenAIRouter) handleUpstreamTransportError(
 	}
 	if ctx != nil && ctx.PendingLooperQuorumOutcome != nil {
 		ctx.PendingLooperQuorumOutcome.Disposition = looper.FusionQuorumResponseEncodeFailed
-		finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false)
-		ctx.PendingLooperQuorumOutcome = nil
+		if err := finalizeLooperQuorumOutcome(ctx, ctx.PendingLooperQuorumOutcome, ctx.VSRSelectedDecision, false); err == nil {
+			ctx.PendingLooperQuorumOutcome = nil
+		}
 	}
 	if ctx != nil && ctx.LooperStreamingActive && !ctx.LooperUsageSettled {
 		settleErr := err

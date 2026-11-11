@@ -1,6 +1,10 @@
 package routing
 
-import "context"
+import (
+	"context"
+
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routing/budget"
+)
 
 // Processor opens routing sessions. The routing core implements it.
 type Processor interface {
@@ -46,4 +50,10 @@ type Evidence struct {
 // call finishes with a local reply or error before response phases begin.
 type OutcomeReporter interface {
 	ReportOutcome(status int, err error)
+}
+
+// BudgetSession is an optional interface a Session may implement to provide
+// the execution budget ledger to the planned call.
+type BudgetSession interface {
+	BudgetLedger() *budget.Ledger
 }
