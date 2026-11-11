@@ -581,7 +581,7 @@ func (r *OpenAIRouter) finalizeSemanticStreamingResponse(ctx *RequestContext, st
 		calibrationPromptTokens,
 	)
 
-	if responseErr != nil || usage.invalid {
+	if responseErr != nil || (ctx.LooperStreamingActive && usage.invalid) {
 		ctx.StreamingAborted = true
 		abortErr := streamErr
 		if abortErr == nil {

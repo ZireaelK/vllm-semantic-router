@@ -225,7 +225,9 @@ func (h *Handler) forward(ctx context.Context, serving Serving, plan *routing.Pl
 			return nil, nil, ctx.Err()
 		}
 		x.record.UpstreamServiceTime = time.Since(sent)
-		return verbatim(localReply(err)), func() {}, nil
+		reply := localReply(err)
+		plan.ReportOutcome(reply.StatusCode, err)
+		return verbatim(reply), func() {}, nil
 	}
 	x.record.UpstreamServiceTime = time.Since(sent)
 	if result.Immediate != nil {
@@ -238,6 +240,11 @@ func (h *Handler) forward(ctx context.Context, serving Serving, plan *routing.Pl
 	}
 	closeBody := func() { _ = resp.Body.Close() }
 	if resp.Local != nil {
+		if ctx.Err() != nil {
+			closeBody()
+			return nil, nil, ctx.Err()
+		}
+		plan.ReportOutcome(resp.StatusCode, resp.Local)
 		return verbatim(resp), closeBody, nil
 	}
 	out, err := serving.Engine.Respond(ctx, plan, &routing.UpstreamResponse{

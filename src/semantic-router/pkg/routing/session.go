@@ -40,3 +40,10 @@ type Evidence struct {
 	CacheHit        bool                `json:"cache_hit,omitempty"`
 	Signals         map[string][]string `json:"signals,omitempty"`
 }
+
+// OutcomeReporter is an optional interface a Session may implement to receive
+// terminal upstream outcome (HTTP status code and classified error) when a
+// call finishes with a local reply or error before response phases begin.
+type OutcomeReporter interface {
+	ReportOutcome(status int, err error)
+}

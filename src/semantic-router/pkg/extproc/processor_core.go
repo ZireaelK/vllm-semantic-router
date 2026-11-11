@@ -23,6 +23,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/sessiontelemetry"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/upstream"
 )
 
 // handleRequestBodyDispatch routes body messages to the correct handler.
@@ -343,7 +344,8 @@ func (r *OpenAIRouter) settleAbortedLooperStreamingUsage(ctx *RequestContext, er
 		abortStage = "upstream_prefill"
 	}
 	abortReason := "upstream_response_failed"
-	if ctx != nil && ctx.UpstreamStatusCode >= 400 {
+	var uErr *upstream.Error
+	if (ctx != nil && ctx.UpstreamStatusCode >= 400) || (errors.As(err, &uErr) && uErr != nil) {
 		abortReason = "upstream_error_response"
 	} else if ctx != nil && ctx.SemanticStreamState != nil && ctx.SemanticStreamState.failed != nil && ctx.SemanticStreamState.failed.Code != "stream_canceled" {
 		abortReason = "upstream_error_response"
@@ -419,6 +421,13 @@ func replayLifecycleForReceiveError(err error) (string, string) {
 
 func resolveReplayLifecycleState(ctx *RequestContext, err error, defaultState, defaultReason string) (string, string) {
 	if ctx != nil && ctx.UpstreamStatusCode > 0 && (ctx.UpstreamStatusCode < 200 || ctx.UpstreamStatusCode >= 300) {
+		return routerreplay.LifecycleFailed, "upstream_error_response"
+	}
+	var upstreamErr *upstream.Error
+	if errors.As(err, &upstreamErr) && upstreamErr != nil {
+		if ctx != nil && ctx.UpstreamStatusCode == 0 {
+			ctx.UpstreamStatusCode = upstreamErr.StatusCode()
+		}
 		return routerreplay.LifecycleFailed, "upstream_error_response"
 	}
 	if ctx != nil && ctx.SemanticStreamState != nil && ctx.SemanticStreamState.failed != nil && ctx.SemanticStreamState.failed.Code != "stream_canceled" {

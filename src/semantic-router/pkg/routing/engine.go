@@ -149,6 +149,27 @@ func (p *Plan) Finish(err error) {
 	p.finish.Do(func() { p.session.Close(err) })
 }
 
+// ReportOutcome reports the terminal upstream status and error to the session
+// before the request ends, for example when a local reply bypasses the response
+// phases.
+func (p *Plan) ReportOutcome(status int, err error) {
+	if p == nil || p.session == nil {
+		return
+	}
+	if reporter, ok := p.session.(OutcomeReporter); ok {
+		reporter.ReportOutcome(status, err)
+	}
+}
+
+// FinishOutcome reports a terminal upstream status and error and finishes the plan.
+func (p *Plan) FinishOutcome(status int, err error) {
+	if p == nil {
+		return
+	}
+	p.ReportOutcome(status, err)
+	p.Finish(err)
+}
+
 func (e *engine) Plan(ctx context.Context, req *Request) (*Plan, error) {
 	if req == nil {
 		return nil, errors.New("routing: nil request")

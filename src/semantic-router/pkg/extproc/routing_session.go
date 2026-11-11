@@ -22,8 +22,9 @@ import (
 // native gateway and Envoy get identical behavior from one pipeline.
 
 var (
-	_ routing.Processor = (*RouterService)(nil)
-	_ routing.Processor = (*OpenAIRouter)(nil)
+	_ routing.Processor       = (*RouterService)(nil)
+	_ routing.Processor       = (*OpenAIRouter)(nil)
+	_ routing.OutcomeReporter = (*routingSession)(nil)
 )
 
 var errSessionEnded = errors.New("routing session has ended")
@@ -57,6 +58,9 @@ type routingSession struct {
 	clientHeader routing.Header
 	// fallback is set once the caller takes over the request's fallback.
 	fallback *sessionFallback
+
+	outcomeStatus int
+	outcomeErr    error
 }
 
 func (r *OpenAIRouter) newRoutingSession(ctx context.Context, release func()) *routingSession {
@@ -146,6 +150,19 @@ func (s *routingSession) Evidence() routing.Evidence {
 	return routingEvidence(s.ctx)
 }
 
+// ReportOutcome records the terminal upstream status and error for local replies
+// or errors that bypass the response phases.
+func (s *routingSession) ReportOutcome(status int, err error) {
+	s.outcomeStatus = status
+	s.outcomeErr = err
+	if s.ctx != nil && status > 0 {
+		s.ctx.UpstreamStatusCode = status
+	}
+	if s.router != nil && s.ctx != nil && status > 0 {
+		s.router.updateRouterReplayStatus(s.ctx, status, false)
+	}
+}
+
 // Close ends the request the way the end of its ext_proc stream would: EOF
 // after a delivered response, cancellation or a deadline when the transport
 // gave up early.
@@ -161,9 +178,11 @@ func (s *routingSession) Close(err error) {
 	if s.ended {
 		return
 	}
+	if s.ctx != nil && s.outcomeStatus > 0 && s.ctx.UpstreamStatusCode == 0 {
+		s.ctx.UpstreamStatusCode = s.outcomeStatus
+	}
 	transportErr := io.EOF
 	switch {
-	case err == nil:
 	case errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded ||
 		(s.ctx != nil && s.ctx.Context != nil && errors.Is(s.ctx.Context.Err(), context.DeadlineExceeded)):
 		transportErr = context.DeadlineExceeded
@@ -172,8 +191,14 @@ func (s *routingSession) Close(err error) {
 		errors.Is(err, context.Canceled) ||
 		status.Code(err) == codes.Canceled:
 		transportErr = context.Canceled
-	default:
+	case err != nil:
 		transportErr = err
+	case s.outcomeErr != nil:
+		transportErr = s.outcomeErr
+	case s.outcomeStatus >= 400:
+		transportErr = fmt.Errorf("upstream returned status %d", s.outcomeStatus)
+	default:
+		transportErr = io.EOF
 	}
 	if s.router != nil {
 		s.end(s.router.handleProcessReceiveError(s.ctx, transportErr))
@@ -212,7 +237,10 @@ func (s *routingSession) phase(
 			s.router.settleAbortedLooperStreamingUsage(s.ctx, err)
 		}
 		state, reason := replayLifecycleForProcessError(err)
-		s.router.finalizeRouterReplay(s.ctx, state, reason)
+		state, reason = resolveReplayLifecycleState(s.ctx, err, state, reason)
+		if s.router != nil {
+			s.router.finalizeRouterReplay(s.ctx, state, reason)
+		}
 		s.end(err)
 		return nil, err
 	}

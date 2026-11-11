@@ -21,6 +21,11 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/upstream"
 )
 
+type fakeOutcome struct {
+	status int
+	err    error
+}
+
 // fakeProcessor answers each phase with a scripted effect and records what it saw.
 type fakeProcessor struct {
 	mu       sync.Mutex
@@ -30,6 +35,7 @@ type fakeProcessor struct {
 	closed   []error
 	planFail error
 	models   []routing.ListenerModels
+	outcomes []fakeOutcome
 }
 
 func (p *fakeProcessor) Open(ctx context.Context) (routing.Session, error) {
@@ -79,6 +85,12 @@ func (s *fakeSession) ResponseBody(b []byte, _ bool) (*routing.Effect, error) {
 }
 
 func (s *fakeSession) Evidence() routing.Evidence { return routing.Evidence{} }
+
+func (s *fakeSession) ReportOutcome(status int, err error) {
+	s.p.mu.Lock()
+	defer s.p.mu.Unlock()
+	s.p.outcomes = append(s.p.outcomes, fakeOutcome{status: status, err: err})
+}
 
 func (s *fakeSession) Close(err error) {
 	s.p.mu.Lock()
@@ -673,5 +685,69 @@ func TestHandlerWritesAnAccessRecord(t *testing.T) {
 	if r.Status != 200 || r.BytesSent != 5 || r.BytesReceived != 4 || r.UpstreamHost != "192.0.2.10:8000" ||
 		r.UserAgent != "client/1" || len(r.RequestID) != 36 || r.Method != "POST" || r.Path != "/v1/chat/completions" {
 		t.Fatalf("record = %+v", r)
+	}
+}
+
+func TestHandlerReportsOutcomeOnLocalReply(t *testing.T) {
+	p := &fakeProcessor{}
+	localErr := &upstream.Error{Kind: upstream.KindConnectFailure, Err: errors.New("connection refused")}
+	u := &fakeUpstream{resp: func() *upstream.Response {
+		return &upstream.Response{
+			StatusCode: 503,
+			Header:     http.Header{"Content-Type": {"text/plain"}},
+			Body:       io.NopCloser(strings.NewReader("upstream connect error")),
+			Local:      localErr,
+		}
+	}}
+	h, err := NewHandler(Options{
+		Serving: Static(Serving{Engine: routing.NewEngine(p, routing.DefaultOptions), Upstream: u}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.outcomes) != 1 {
+		t.Fatalf("expected 1 outcome reported, got %d", len(p.outcomes))
+	}
+	if p.outcomes[0].status != 503 || !errors.Is(p.outcomes[0].err, localErr) {
+		t.Fatalf("outcome = %+v, want status 503 and localErr", p.outcomes[0])
+	}
+	if len(p.closed) != 1 {
+		t.Fatalf("expected 1 close call, got %d", len(p.closed))
+	}
+}
+
+func TestHandlerReportsOutcomeOnUpstreamExecuteError(t *testing.T) {
+	p := &fakeProcessor{}
+	dialErr := &upstream.Error{Kind: upstream.KindTimeout, Stage: upstream.StageFirstByte, Err: errors.New("timed out")}
+	u := &fakeUpstream{err: dialErr}
+	h, err := NewHandler(Options{
+		Serving: Static(Serving{Engine: routing.NewEngine(p, routing.DefaultOptions), Upstream: u}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504", rec.Code)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.outcomes) != 1 {
+		t.Fatalf("expected 1 outcome reported, got %d", len(p.outcomes))
+	}
+	if p.outcomes[0].status != 504 || !errors.Is(p.outcomes[0].err, dialErr) {
+		t.Fatalf("outcome = %+v, want status 504 and dialErr", p.outcomes[0])
 	}
 }
